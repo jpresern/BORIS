@@ -3,7 +3,7 @@
 """
 BORIS
 Behavioral Observation Research Interactive Software
-Copyright 2012-2017 Olivier Friard
+Copyright 2012-2018 Olivier Friard
 
 This file is part of BORIS.
 
@@ -29,11 +29,13 @@ project_format_version = "4.0"
 
 VLC_MIN_VERSION = "2"
 
-CHECK_NEW_VERSION_DELAY = 15*24*60*60
+CHECK_NEW_VERSION_DELAY = 15 * 24 * 60 * 60
 
 #FFMPEG_BIN = 'ffmpeg'
 
-function_keys = {16777264: 'F1',16777265: 'F2',16777266: 'F3',16777267: 'F4',16777268: 'F5', 16777269: 'F6', 16777270: 'F7', 16777271: 'F8', 16777272: 'F9', 16777273: 'F10',16777274: 'F11', 16777275: 'F12'}
+function_keys = {16777264: 'F1', 16777265: 'F2', 16777266: 'F3', 16777267: 'F4', 16777268: 'F5',
+                 16777269: 'F6', 16777270: 'F7', 16777271: 'F8', 16777272: 'F9', 16777273: 'F10',
+                 16777274: 'F11', 16777275: 'F12'}
 
 PROJECT_NAME = "project_name"
 PROJECT_DATE = "project_date"
@@ -49,6 +51,7 @@ BEHAVIORS_CODING_MAP = 'behaviors_coding_map'
 SUBJECTS = 'subjects_conf'
 ETHOGRAM = 'behaviors_conf'
 BEHAVIORAL_CATEGORIES = "behavioral_categories"
+CONVERTERS = "converters"
 
 CODING_MAP_RESIZE_W = 640
 CODING_MAP_RESIZE_H = 640
@@ -72,6 +75,30 @@ NO_FOCAL_SUBJECT = 'No focal subject'
 TYPE = "type"
 FILE = "file"
 
+PLOT_DATA = "plot_data"
+
+PLOT_DATA_FILEPATH_IDX = 0
+PLOT_DATA_COLUMNS_IDX = 1
+PLOT_DATA_PLOTTITLE_IDX = 2
+PLOT_DATA_VARIABLENAME_IDX = 3
+PLOT_DATA_CONVERTERS_IDX = 4
+PLOT_DATA_TIMEINTERVAL_IDX = 5
+PLOT_DATA_TIMEOFFSET_IDX = 6
+PLOT_DATA_SUBSTRACT1STVALUE_IDX = 7
+PLOT_DATA_PLOTCOLOR_IDX = 8
+
+DATA_PLOT_FIELDS = {PLOT_DATA_FILEPATH_IDX: "file_path",
+                    PLOT_DATA_COLUMNS_IDX: "columns",
+                    PLOT_DATA_PLOTTITLE_IDX: "title",
+                    PLOT_DATA_VARIABLENAME_IDX: "variable_name",
+                    PLOT_DATA_CONVERTERS_IDX: "converters",
+                    PLOT_DATA_TIMEINTERVAL_IDX: "time_interval",
+                    PLOT_DATA_TIMEOFFSET_IDX: "time_offset",
+                    PLOT_DATA_SUBSTRACT1STVALUE_IDX: "substract_first_value",
+                    PLOT_DATA_PLOTCOLOR_IDX: "color"
+                    }
+DATA_PLOT_STYLES = ["b-", "r-", "g-", "bo", "ro", "go"]
+
 BEHAVIOR_CODE = "code"
 
 # fields for event configuration
@@ -87,6 +114,8 @@ behavioursFields = {'type': 0, 'key': 1, 'code': 2, 'description': 3, 'category'
 
 BEHAVIOR_TYPES = ["Point event", "State event", "Point event with coding map", "State event with coding map"]
 
+DEFAULT_BEHAVIOR_TYPE = "Point event"
+
 # fields for events table
 tw_events_fields = ['time', 'subject', 'code', 'type', 'modifier', 'comment']
 
@@ -96,6 +125,8 @@ pj_events_fields = ["time", "subject", "code", "modifier", "comment"]
 tw_indVarFields = ["label", "description", "type", "default value", "possible values"]
 
 BEHAV_CODING_MAP_FIELDS = ["name", "Behavior codes"]
+
+EXCEL_FORBIDDEN_CHARACTERS = r"\/*[]:?"
 
 # create dictionaries
 tw_obs_fields, pj_obs_fields = {}, {}
@@ -170,16 +201,18 @@ OPENCV = 'opencv'
 VLC = 'vlc'
 FFMPEG = 'ffmpeg'
 
-MEDIA_FILE_INFO = 'media_file_info'
+MEDIA_FILE_INFO = "media_file_info"
 
-STATE = 'STATE'
-POINT = 'POINT'
+STATE = "STATE"
+POINT = "POINT"
 
 START = "START"
 STOP = "STOP"
 
-PLAYER1 = '1'
-PLAYER2 = '2'
+PLAYER1, PLAYER2 = "1", "2"
+ALL_PLAYERS = [PLAYER1, PLAYER2]
+
+POINT_EVENT_ST_DURATION = 0.5
 
 VIDEO_TAB = 0
 FRAME_TAB = 1
@@ -219,7 +252,7 @@ BEHAVIORS_PLOT_COLORS = ['tab:blue',
                          "blue", "green", "red", "cyan", "magenta","yellow", "lime",
                          "darksalmon", "purple", "orange", "maroon", "silver",
                          "slateblue", "hotpink", "steelblue", "darkgoldenrod",
-                         'aliceblue','antiquewhite','aqua','aquamarine','azure',
+                         'aqua','aquamarine',
                          'beige','bisque','black','blanchedalmond','blueviolet','brown',
                          'burlywood','cadetblue','chartreuse','chocolate','coral',
                          'cornflowerblue','cornsilk','crimson','darkblue','darkcyan',
@@ -228,10 +261,10 @@ BEHAVIORS_PLOT_COLORS = ['tab:blue',
                          'darksage','darkseagreen','darkslateblue','darkslategray',
                          'darkslategrey','darkturquoise','darkviolet','deeppink',
                          'deepskyblue','dimgray','dimgrey','dodgerblue','firebrick',
-                         'floralwhite','forestgreen','fuchsia','gainsboro','ghostwhite',
+                         'floralwhite','forestgreen','fuchsia','gainsboro',
                          'gold','goldenrod','gray','greenyellow','grey','honeydew',
-                         'indianred','indigo','ivory','khaki','lavender','lavenderblush',
-                         'lawngreen','lemonchiffon','lightblue','lightcoral','lightcyan',
+                         'indianred','indigo','khaki',
+                         'lawngreen','lemonchiffon','lightblue','lightcoral',
                          'lightgoldenrodyellow','lightgray','lightgreen','lightgrey',
                          'lightpink','lightsage','lightsalmon','lightseagreen',
                          'lightskyblue','lightslategray','lightslategrey','lightsteelblue',
@@ -243,6 +276,20 @@ BEHAVIORS_PLOT_COLORS = ['tab:blue',
                          'palegoldenrod','palegreen','paleturquoise','palevioletred',
                          'papayawhip','peachpuff','peru','pink','plum','powderblue','rosybrown',
                          'royalblue','saddlebrown','sage','salmon','sandybrown','seagreen',
-                         'seashell','sienna','skyblue','slategray','slategrey','snow',
+                         'seashell','sienna','skyblue','slategray','slategrey',
                          'springgreen','tan','teal','thistle','tomato','turquoise','violet',
-                         'wheat','white','whitesmoke','yellowgreen','darkgray']
+                         'wheat','yellowgreen','darkgray']
+
+EMPTY_PROJECT = {"time_format": HHMMSS,
+                       "project_date": "",
+                       "project_name": "",
+                       "project_description": "",
+                       "project_format_version": project_format_version,
+                       SUBJECTS: {},
+                       ETHOGRAM: {},
+                       OBSERVATIONS: {},
+                       BEHAVIORAL_CATEGORIES: [],
+                       INDEPENDENT_VARIABLES: {},
+                       CODING_MAP: {},
+                       BEHAVIORS_CODING_MAP: [],
+                       CONVERTERS: {}}

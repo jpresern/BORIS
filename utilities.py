@@ -3,7 +3,7 @@
 """
 BORIS
 Behavioral Observation Research Interactive Software
-Copyright 2012-2017 Olivier Friard
+Copyright 2012-2018 Olivier Friard
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -29,28 +29,363 @@ except:
     from PyQt4.QtGui import *
 
 import math
+import csv
 import re
 import subprocess
+import hashlib
 import urllib.parse
 import sys
 import os
 import logging
-from config import *
 import subprocess
 from decimal import *
 import math
 import datetime
 import socket
+import numpy as np
+
+from config import *
 
 
-def versiontuple(v):
-    return tuple(map(int, (v.split("."))))
+def bytes_to_str(b):
+    """
+    Translate bytes to string.
+    
+    Args:
+        b (bytes): byte to convert
+    
+    Returns:
+        str: converted byte
+    """
+
+    if isinstance(b, bytes):
+        fileSystemEncoding = sys.getfilesystemencoding()
+        # hack for PyInstaller
+        if fileSystemEncoding is None:
+            fileSystemEncoding = "UTF-8"
+        return b.decode(fileSystemEncoding)
+    else:
+        return b
+
+
+def ffmpeg_recode(video_paths, horiz_resol, ffmpeg_bin):
+    """
+    recode one or more video with ffmpeg
+    
+    Args:
+        video_paths (list): list of video paths
+        horiz_resol (int): horizontal resolution (in pixels)
+        ffmpeg_bin (str): path of ffmpeg program
+    
+    Returns:
+        bool: True
+    """
+
+    for video_path in video_paths:
+        ffmpeg_command = ('"{ffmpeg_bin}" -y -i "{input_}" '
+                          '-vf scale={horiz_resol}:-1 -b 2000k '
+                          '"{input_}.re-encoded.{horiz_resol}px.avi" ').format(ffmpeg_bin=ffmpeg_bin,
+                                                                               input_=video_path,
+                                                                               horiz_resol=horiz_resol)
+        p = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        p.communicate()
+
+    return True
+
+
+def convert_time_to_decimal(pj):
+    """
+    convert time from float to decimal
+    
+    Args:
+        pj (dict): BORIS project
+        
+    Returns:
+        dict: BORIS project
+    """
+
+    for obsId in pj[OBSERVATIONS]:
+        if "time offset" in pj[OBSERVATIONS][obsId]:
+            pj[OBSERVATIONS][obsId]["time offset"] = Decimal(str(pj[OBSERVATIONS][obsId]["time offset"]))
+        for idx, event in enumerate(pj[OBSERVATIONS][obsId][EVENTS]):
+            pj[OBSERVATIONS][obsId][EVENTS][idx][pj_obs_fields["time"]] = Decimal(str(pj[OBSERVATIONS][obsId][EVENTS][idx][pj_obs_fields["time"]]))
+
+    return pj
+
+
+def file_content_md5(file_name):
+    hash_md5 = hashlib.md5()
+    with open(file_name, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def txt2np_array(file_name, columns_str, substract_first_value, converters = {}, column_converter={}):
+    """read a txt file (tsv or csv) and return np array with passed columns
+    
+    Args:
+        file_name (str): path of the file to load in numpy array
+        columns_str (str): indexes of columns to be loaded. First columns must be the timestamp. Example: "4,5"
+        substract_first_value (str): "True" or "False"
+        converters (dict): dictionary containing converters
+        column_converter (dict): dcitionary key: column index, value: converter name
+
+    Returns:
+        bool: True if data successfullly loaded, False if case of error
+        str: error message. Empty if success
+        numpy array: data. Empty if not data failed to be loaded
+
+    """
+    # check columns
+    try:
+        columns = [int(x) - 1 for x in columns_str.split(",") ]
+    except:
+        return False, "Problem with columns {}".format(columns_str), np.array([])
+    
+    # check converters
+    np_converters = {}
+    for column_idx in column_converter:
+        if column_converter[column_idx] in converters:
+            
+            conv_name = column_converter[column_idx]
+            
+            function = """def {}(INPUT):\n""".format(conv_name)
+            function += """    INPUT = INPUT.decode("utf-8") if isinstance(INPUT, bytes) else INPUT"""
+            for line in converters[conv_name]["code"].split("\n"):
+                function += "    {}\n".format(line)
+            function += """    return OUTPUT"""
+
+            try:
+                exec(function)
+            except:
+                #print(sys.exc_info()[1])
+                return False, "error in converter", np.array([]) 
+            
+            np_converters[column_idx - 1] = locals()[conv_name]
+
+        else:
+            print("converter {} not found".format(converters_param[column_idx]))
+            return False, "converter not found", np.array([]) 
+
+    # snif txt file
+    with open(file_name) as csvfile:
+        buff = csvfile.read(1024)
+        snif = csv.Sniffer()
+        dialect = snif.sniff(buff)
+        has_header = snif.has_header(buff)
+
+    try:
+        data = np.loadtxt(file_name,
+                          delimiter=dialect.delimiter,
+                          usecols=columns,
+                          skiprows=has_header,
+                          converters=np_converters)
+    except:
+        return False, sys.exc_info()[1], np.array([])
+
+    # check if first value must be substracted
+    if substract_first_value == "True":
+        data[:,0] -= data[:,0][0]
+
+    return True, "", data
+
+
+def versiontuple(version_str):
+    """Convert version from text to tuple
+    
+    Args:
+        version_str (str): version
+        
+    Returns:
+        tuple: version in tuple format (for comparison)
+    """
+    return tuple(map(int, (version_str.split("."))))
+
+
+def state_behavior_codes(ethogram):
+    """
+    behavior codes defined as STATE event
+    
+    Args:
+        ethogram (dict): ethogram dictionary
+        
+    Returns:
+        list: list of behavior codes defined as STATE event
+    
+    """
+    return [ethogram[x][BEHAVIOR_CODE] for x in ethogram if "STATE" in ethogram[x][TYPE].upper()]
+
+
+def get_current_states_by_subject(state_behaviors_codes, events, subjects, time):
+    """
+    get current states for subjects at given time
+    Args:
+        state_behaviors_codes (list): list of behavior codes defined as STATE event
+        events (list): list of events
+        subjects (dict): dictionary of subjects
+        time (Decimal): time
+
+    Returns:
+        dict: current states by subject. dict of list
+    """
+    current_states = {}
+    for idx in subjects:
+        current_states[idx] = []
+        for sbc in state_behaviors_codes:
+            if len([x[EVENT_BEHAVIOR_FIELD_IDX] for x in events
+                                                   if x[EVENT_SUBJECT_FIELD_IDX] == subjects[idx]["name"]
+                                                      and x[EVENT_BEHAVIOR_FIELD_IDX] == sbc
+                                                      and x[EVENT_TIME_FIELD_IDX] <= time]) % 2: # test if odd
+                current_states[idx].append(sbc)
+
+    return current_states
+
+
+def get_current_points_by_subject(point_behaviors_codes, events, subjects, time, distance):
+    """
+    get near point events for subjects at given time
+    Args:
+        point_behaviors_codes (list): list of behavior codes defined as POINT event
+        events (list): list of events
+        subjects (dict): dictionary of subjects
+        time (Decimal): time
+        distance (Decimal): distance from time
+
+    Returns:
+        dict: current states by subject. dict of list
+    """
+    current_points = {}
+    for idx in subjects:
+        current_points[idx] = []
+        for sbc in point_behaviors_codes:
+            events = [[x[EVENT_BEHAVIOR_FIELD_IDX], x[EVENT_MODIFIER_FIELD_IDX]] for x in events
+                                                   if x[EVENT_SUBJECT_FIELD_IDX] == subjects[idx]["name"]
+                                                      and x[EVENT_BEHAVIOR_FIELD_IDX] == sbc
+                                                      and abs(x[EVENT_TIME_FIELD_IDX] - time) <= distance]
+            
+            for event in events:
+                current_points[idx].append(event)
+
+    return current_points
+
+'''
+def get_current_states_modifiers_by_subject(state_behaviors_codes, events, subjects, time):
+    """
+    get current states and modifiers for subjects at given time
+    Args:
+        state_behaviors_codes (list): list of behavior codes defined as STATE event
+        events (list): list of events
+        subjects (dict): dictionary of subjects
+        time (Decimal): time
+
+    Returns:
+        dict: current state(s) and modifier(s) by subject. dict of list
+    """
+
+    current_states = get_current_states_by_subject(state_behaviors_codes, events, subjects, time)
+    cm = {}
+    for behavior in current_states[subject]:
+        for event in events:
+            if event[EVENT_TIME_FIELD_IDX] > currentTime:
+                break
+            if event[EVENT_SUBJECT_FIELD_IDX] == subject:
+                if event[EVENT_BEHAVIOR_FIELD_IDX] == behavior:
+                    cm[behavior] = event[EVENT_MODIFIER_FIELD_IDX]
+
+
+    return current_states
+'''
 
 
 def get_ip_address():
+    """Get current IP address
+    
+    Args:
+    
+    Returns:
+        str: IP address
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.connect(("8.8.8.8", 80))
     return s.getsockname()[0]
+
+
+def check_txt_file(file_name):
+    """Extract parameters of txt file (test for tsv csv)
+    
+    Args:
+        filename (str): path of file to be analyzed
+        
+    Returns:
+        dict: 
+    """
+
+    # snif txt file
+    with open(file_name) as csvfile:
+        buff = csvfile.read(1024)
+        snif = csv.Sniffer()
+        dialect = snif.sniff(buff)
+
+        has_header = snif.has_header(buff)
+
+
+        logging.debug("dialect.delimiter: {}".format(dialect.delimiter))
+
+    '''data = np.loadtxt(file_name,
+                          delimiter=dialect.delimiter,
+       #                          usecols=columns,
+                          skiprows=has_header  #,
+                          #converters=np_converters,
+                          )
+        
+
+    '''
+    
+    '''
+    # test CSV
+    rows_len = []
+    with open(file_name, "r") as f:
+        reader = csv.reader(f)
+        try:
+            for row in reader:
+                if len(row) not in rows_len:
+                    rows_len.append(len(row))
+                    if len(rows_len) > 1:
+                        break
+        except:
+            return {"error": "Data file error"}
+
+    if len(rows_len) == 1 and rows_len[0] >= 2:
+        return {"homogeneous": True, "fields number": rows_len[0], "separator": ","}
+    '''
+    
+
+    csv.register_dialect("dialect", dialect)
+    rows_len = []
+    with open(file_name, "r") as f:
+        reader = csv.reader(f, dialect="dialect")
+        for row in reader:
+            logging.debug("row: {}".format(row))
+            if not row:
+                continue
+            if len(row) not in rows_len:
+                rows_len.append(len(row))
+                if len(rows_len) > 1:
+                    break
+
+    # test if file empty
+    if not len(rows_len):
+        return {"error": "The file is empty"}
+    if len(rows_len) == 1 and rows_len[0] >= 2:
+        return {"homogeneous": True, "fields number": rows_len[0], "separator": "\t"}
+    
+    if len(rows_len) > 1:
+        return {"homogeneous": False}
+    else:
+        return {"homogeneous": True, "fields number": rows_len[0]}
+
+
 
 '''
 def get_set_of_modifiers(text):
@@ -105,6 +440,7 @@ def extract_frames(ffmpeg_bin, second, currentMedia, fps, imageDir, md5FileName,
                     extension=extension,
                     frame_resize=frame_resize
                     )
+
     logging.debug("ffmpeg command: {}".format(ffmpeg_command))
 
     p = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
@@ -131,6 +467,12 @@ def complete(l, max):
 
 
 def datetime_iso8601():
+    """
+    current date time in ISO8601 format
+    
+    Returns:
+        str: date time in ISO8601 format
+    """
     return datetime.datetime.now().isoformat().replace("T", "").split(".")[0]
 
 
@@ -308,6 +650,13 @@ def eol2space(s):
 def test_ffmpeg_path(FFmpegPath):
     """
     test if ffmpeg has valid path
+    
+    Args:
+        FFmpegPath (str): ffmepg path to test
+        
+    Returns:
+        bool: True: path found
+        str: message
     """
 
     out, error = subprocess.Popen('"{0}" -version'.format(FFmpegPath), stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True).communicate()
@@ -360,7 +709,11 @@ def playWithVLC(fileName):
 
 def check_ffmpeg_path():
     """
-    check ffmpeg path
+    check for ffmpeg path
+    
+    Returns:
+        bool: True if ffmpeg path found else False
+        str: if bool True returns ffmpegpath else returns error message
     """
 
     if os.path.isfile(sys.path[0]):  # pyinstaller
@@ -375,24 +728,23 @@ def check_ffmpeg_path():
             ffmpeg_bin = os.path.abspath(os.path.join(syspath, os.pardir)) + "/FFmpeg/ffmpeg"
             r, msg = test_ffmpeg_path(ffmpeg_bin)
             if r:
-                return ffmpeg_bin
+                return True, ffmpeg_bin
 
         # check if ffmpeg in same directory than boris.py
         if os.path.exists(syspath + "/ffmpeg"):
             ffmpeg_bin = syspath + "/ffmpeg"
             r, msg = test_ffmpeg_path(ffmpeg_bin)
             if r:
-                return ffmpeg_bin
+                return True, ffmpeg_bin
 
         # check for ffmpeg in system path
         ffmpeg_bin = "ffmpeg"
         r, msg = test_ffmpeg_path(ffmpeg_bin)
         if r:
-            return ffmpeg_bin
+            return True, ffmpeg_bin
         else:
             logging.critical("FFmpeg is not available")
-            QMessageBox.critical(None, programName, msg, QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-            return False
+            return False, "FFmpeg is not available"
 
     if sys.platform.startswith("win"):
 
@@ -401,19 +753,18 @@ def check_ffmpeg_path():
             ffmpeg_bin = os.path.abspath(os.path.join(syspath, os.pardir)) + "\\FFmpeg\\ffmpeg.exe"
             r, msg = test_ffmpeg_path(ffmpeg_bin)
             if r:
-                return ffmpeg_bin
+                return True, ffmpeg_bin
 
         if os.path.exists(syspath + "\\ffmpeg.exe"):
             ffmpeg_bin = syspath + "\\ffmpeg.exe"
             r, msg = test_ffmpeg_path(ffmpeg_bin)
             if r:
-                return ffmpeg_bin
+                return True, ffmpeg_bin
             else:
                 logging.critical("FFmpeg is not available")
-                QMessageBox.critical(None, programName, "FFmpeg is not available.<br>Go to http://www.ffmpeg.org to download it", QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-                return False
+                return False, "FFmpeg is not available"
 
-    return False
+    return False, "FFmpeg is not available"
 
 
 def accurate_media_analysis(ffmpeg_bin, fileName):

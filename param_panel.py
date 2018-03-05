@@ -3,7 +3,7 @@
 """
 BORIS
 Behavioral Observation Research Interactive Software
-Copyright 2012-2017 Olivier Friard
+Copyright 2012-2018 Olivier Friard
 
 This file is part of BORIS.
 
@@ -64,11 +64,13 @@ class Param_panel(QDialog, Ui_Dialog):
         self.rb_limit.clicked.connect(lambda: self.rb_time(TIME_EVENTS))
         self.rb_interval.clicked.connect(lambda: self.rb_time(TIME_ARBITRARY_INTERVAL))
 
+
     def rb_time(self, button):
         """
         time
         """
         self.frm_time_interval.setEnabled(button == TIME_ARBITRARY_INTERVAL)
+
 
     def subjects_button_clicked(self, command):
         for idx in range(self.lwSubjects.count()):
@@ -83,8 +85,6 @@ class Param_panel(QDialog, Ui_Dialog):
 
     def behaviors_button_clicked(self, command):
         for idx in range(self.lwBehaviors.count()):
-
-            #print(self.lwBehaviors.item(idx).text(), self.lwBehaviors.item(idx).data(33), self.lwBehaviors.item(idx).data(34))
 
             if self.lwBehaviors.item(idx).data(33) != "category":
                 if command == "select all":

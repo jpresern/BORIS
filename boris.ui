@@ -49,6 +49,13 @@
          </widget>
         </item>
         <item>
+         <widget class="QLabel" name="lb_current_media_time">
+          <property name="text">
+           <string>TextLabel</string>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QLabel" name="lbFocalSubject">
           <property name="text">
            <string>lbFocalSubject</string>
@@ -76,7 +83,7 @@
              <x>0</x>
              <y>0</y>
              <width>532</width>
-             <height>383</height>
+             <height>360</height>
             </rect>
            </property>
            <attribute name="label">
@@ -113,13 +120,21 @@
     <property name="title">
      <string>File</string>
     </property>
+    <widget class="QMenu" name="menuRecent_projects">
+     <property name="title">
+      <string>Recent projects</string>
+     </property>
+     <addaction name="separator"/>
+    </widget>
     <addaction name="actionNew_project"/>
     <addaction name="actionOpen_project"/>
+    <addaction name="menuRecent_projects"/>
     <addaction name="actionEdit_project"/>
     <addaction name="actionSave_project"/>
     <addaction name="actionSave_project_as"/>
     <addaction name="actionClose_project"/>
     <addaction name="separator"/>
+    <addaction name="actionRemove_path_from_media_files"/>
     <addaction name="actionSend_project"/>
     <addaction name="separator"/>
     <addaction name="actionPreferences"/>
@@ -140,6 +155,7 @@
     </widget>
     <addaction name="actionNew_observation"/>
     <addaction name="actionOpen_observation"/>
+    <addaction name="actionView_observation"/>
     <addaction name="actionEdit_observation_2"/>
     <addaction name="actionObservationsList"/>
     <addaction name="actionOpen_observation_2"/>
@@ -248,6 +264,7 @@
      <addaction name="action_create_modifiers_coding_map"/>
     </widget>
     <addaction name="actionShow_spectrogram"/>
+    <addaction name="actionShow_data_files"/>
     <addaction name="actionDistance"/>
     <addaction name="actionBehaviors_coding_map"/>
     <addaction name="actionCoding_pad"/>
@@ -694,6 +711,9 @@
    <property name="text">
     <string>Add event</string>
    </property>
+   <property name="shortcut">
+    <string>Ctrl+A</string>
+   </property>
   </action>
   <action name="actionDeselectCurrentSubject">
    <property name="text">
@@ -1129,6 +1149,26 @@
   <action name="actionSubjects_pad">
    <property name="text">
     <string>Subjects pad</string>
+   </property>
+  </action>
+  <action name="actionShow_data_files">
+   <property name="text">
+    <string>Show data files</string>
+   </property>
+  </action>
+  <action name="actionConverters_manager">
+   <property name="text">
+    <string>Time converters manager</string>
+   </property>
+  </action>
+  <action name="actionView_observation">
+   <property name="text">
+    <string>View observation</string>
+   </property>
+  </action>
+  <action name="actionRemove_path_from_media_files">
+   <property name="text">
+    <string>Remove path from media files</string>
    </property>
   </action>
  </widget>

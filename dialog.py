@@ -3,7 +3,7 @@
 """
 BORIS
 Behavioral Observation Research Interactive Software
-Copyright 2012-2017 Olivier Friard
+Copyright 2012-2018 Olivier Friard
 
 This file is part of BORIS.
 
@@ -113,7 +113,7 @@ class DuplicateBehaviorCode(QDialog):
 
 class ChooseObservationsToImport(QDialog):
     """
-
+    dialog for selectiong items
     """
 
     def __init__(self, text, observations_list):
@@ -174,7 +174,6 @@ class ChooseObservationsToImport(QDialog):
         self.accept()
 
 
-
 class JumpTo(QDialog):
     """
     "jump to" dialog box
@@ -211,7 +210,6 @@ class JumpTo(QDialog):
 
     def pbCancel_clicked(self):
         self.reject()
-
 
 
 class EditSelectedEvents(QDialog):
@@ -315,19 +313,19 @@ class FindInEvents(QWidget):
         hbox = QVBoxLayout()
 
         self.cbSubject = QCheckBox("Subject")
-        self.cbSubject.setChecked(False)
+        self.cbSubject.setChecked(True)
         hbox.addWidget(self.cbSubject)
 
         self.cbBehavior = QCheckBox("Behavior")
-        self.cbBehavior.setChecked(False)
+        self.cbBehavior.setChecked(True)
         hbox.addWidget(self.cbBehavior)
 
         self.cbModifier = QCheckBox("Modifiers")
-        self.cbModifier.setChecked(False)
+        self.cbModifier.setChecked(True)
         hbox.addWidget(self.cbModifier)
 
         self.cbComment = QCheckBox("Comment")
-        self.cbComment.setChecked(False)
+        self.cbComment.setChecked(True)
         hbox.addWidget(self.cbComment)
 
         self.lbFind = QLabel("Find")
@@ -336,10 +334,12 @@ class FindInEvents(QWidget):
         self.findText = QLineEdit()
         hbox.addWidget(self.findText)
 
-
         self.cbFindInSelectedEvents = QCheckBox("Find in selected events")
         self.cbFindInSelectedEvents.setChecked(False)
         hbox.addWidget(self.cbFindInSelectedEvents)
+
+        self.lb_message = QLabel()
+        hbox.addWidget(self.lb_message)
 
         hbox2 = QHBoxLayout()
         self.pbOK = QPushButton("Find")
@@ -351,7 +351,6 @@ class FindInEvents(QWidget):
         hbox.addLayout(hbox2)
 
         self.setLayout(hbox)
-
 
     def click(self, msg):
         self.clickSignal.emit(msg)
@@ -431,7 +430,7 @@ class ResultsWidget(QWidget):
     widget for visualizing text output
     """
     def __init__(self):
-        super(ResultsWidget, self).__init__()
+        super().__init__()
 
         self.setWindowTitle("")
 
@@ -444,17 +443,36 @@ class ResultsWidget(QWidget):
         hbox.addWidget(self.ptText)
 
         hbox2 = QHBoxLayout()
-        self.pbOK = QPushButton("OK")
-        self.pbOK.clicked.connect(self.pbOK_clicked)
+        self.pbSave = QPushButton("Save results")
+        self.pbSave.clicked.connect(self.save_results)
+        hbox2.addWidget(self.pbSave)
 
+        self.pbOK = QPushButton("OK")
+        self.pbOK.clicked.connect(self.close)
         hbox2.addWidget(self.pbOK)
+
         hbox.addLayout(hbox2)
 
         self.setLayout(hbox)
 
+        self.resize(540, 640)
 
-    def pbOK_clicked(self):
-        self.close()
+
+    def save_results(self):
+        """
+        save content of self.ptText
+        """
+        
+        fn = QFileDialog(self).getSaveFileName(self, "Save results", "", "Text files (*.txt *.tsv);;All files (*)")
+        file_name = fn[0] if type(fn) is tuple else fn
+        
+        if file_name:
+            try:
+                with open(file_name, "w") as f:
+                    f.write(self.ptText.toPlainText())
+            except:
+                QMessageBox.critical(self, programName, "The file {} can not be saved".format(file_name))
+
 
 
 class FrameViewer(QWidget):
@@ -470,15 +488,6 @@ class FrameViewer(QWidget):
 
         self.lbFrame = QLabel("")
         hbox.addWidget(self.lbFrame)
-
-        '''
-        hbox2 = QHBoxLayout()
-        self.pbOK = QPushButton("OK")
-        self.pbOK.clicked.connect(self.pbOK_clicked)
-
-        hbox2.addWidget(self.pbOK)
-        hbox.addLayout(hbox2)
-        '''
 
         self.setLayout(hbox)
 

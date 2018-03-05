@@ -3,7 +3,7 @@
 """
 BORIS
 Behavioral Observation Research Interactive Software
-Copyright 2012-2017 Olivier Friard
+Copyright 2012-2018 Olivier Friard
 
 This file is part of BORIS.
 
@@ -45,6 +45,7 @@ import datetime
 import multiprocessing
 import socket
 import copy
+import pathlib
 
 try:
     from PyQt5.QtCore import *
@@ -57,7 +58,6 @@ except:
         from PyQt4.QtCore import *
         from PyQt4.QtGui import *
         from boris_ui import *
-
     except:
         logging.critical("PyQt4 not installed!\nTry PyQt4")
         sys.exit()
@@ -69,6 +69,7 @@ import matplotlib.pyplot as plt
 import matplotlib.transforms as mtransforms
 from matplotlib import dates
 
+import select_observations
 import dialog
 from edit_event import *
 from project import *
@@ -94,12 +95,15 @@ import select_modifiers
 import behaviors_coding_map
 import plot_events
 import project_functions
+import plot_data_module
+import measurement_widget
+import irr
+import db_functions
+import export_observation
 
 
-__version__ = "5.1.0"
-__version_date__ = "2017-11-15"
-
-# BITMAP_EXT = "jpg"
+__version__ = "6.1.1"
+__version_date__ = "2018-03-01"
 
 if platform.python_version() < "3.4":
     logging.critical("BORIS requires Python 3.4+! You are using v. {}")
@@ -117,9 +121,11 @@ parser.add_option("-v", "--version", action="store_true", default=False, dest="v
 parser.add_option("-n", "--nosplashscreen", action="store_true", default=False, help="No splash screen")
 parser.add_option("-p", "--project", action="store", help="Project file")
 parser.add_option("-o", "--observation", action="store",  help="Observation id")
+'''
 parser.add_option("-i", "--project-info", action="store_true", default=False, help="Project information")
 parser.add_option("-l", "--observations-list", action="store_true", default=False, help="List of observations")
 parser.add_option("-a", "--action", action="store",  help="action")
+'''
 
 (options, args) = parser.parse_args()
 
@@ -133,51 +139,8 @@ if options.version:
     print("version {0} release date: {1}".format(__version__, __version_date__))
     sys.exit(0)
 
-
 video, live = 0, 1
-'''
-try:
-    import matplotlib
-    FLAG_MATPLOTLIB_INSTALLED = True
-except:
-    logging.warning("matplotlib plotting library not installed")
-    FLAG_MATPLOTLIB_INSTALLED = False
-'''
 FLAG_MATPLOTLIB_INSTALLED = True
-
-
-def ffmpeg_recode(video_paths, horiz_resol, ffmpeg_bin):
-    """
-    recode one or more video with ffmpeg
-    video_paths: list of video paths
-    horiz_resol: horizontal resolution (in pixels)
-    ffmpeg_bin: path of ffmpeg program
-    """
-
-    for video_path in video_paths:
-        ffmpeg_command = ('"{ffmpeg_bin}" -y -i "{input_}" '
-                          '-vf scale={horiz_resol}:-1 -b 2000k '
-                          '"{input_}.re-encoded.{horiz_resol}px.avi" ').format(ffmpeg_bin=ffmpeg_bin,
-                                                                               input_=video_path,
-                                                                               horiz_resol=horiz_resol)
-        p = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-        p.communicate()
-
-    return True
-
-
-def bytes_to_str(b):
-    """
-    Translate bytes to string.
-    """
-    if isinstance(b, bytes):
-        fileSystemEncoding = sys.getfilesystemencoding()
-        # hack for PyInstaller
-        if fileSystemEncoding is None:
-            fileSystemEncoding = "UTF-8"
-        return b.decode(fileSystemEncoding)
-    else:
-        return b
 
 
 class ProjectServerThread(QThread):
@@ -288,14 +251,11 @@ class StyledItemDelegateTriangle(QStyledItemDelegate):
         super(StyledItemDelegateTriangle, self).paint(painter, option, index)
 
         if ROW != -1:
-
             if index.row() == ROW:
-
                 polygonTriangle = QPolygon(3)
                 polygonTriangle.setPoint(0, QtCore.QPoint(option.rect.x() + 15, option.rect.y()))
                 polygonTriangle.setPoint(1, QtCore.QPoint(option.rect.x(), option.rect.y() - 5))
                 polygonTriangle.setPoint(2, QtCore.QPoint(option.rect.x(), option.rect.y() + 5))
-
                 painter.save()
                 painter.setRenderHint(painter.Antialiasing)
                 painter.setBrush(QBrush(QColor(QtCore.Qt.red)))
@@ -306,26 +266,11 @@ class StyledItemDelegateTriangle(QStyledItemDelegate):
 
 class MainWindow(QMainWindow, Ui_MainWindow):
 
-    pj = {"time_format": HHMMSS,
-          "project_date": "",
-          "project_name": "",
-          "project_description": "",
-          "project_format_version": project_format_version,
-          SUBJECTS: {},
-          ETHOGRAM: {},
-          OBSERVATIONS: {},
-          BEHAVIORAL_CATEGORIES: [],
-          INDEPENDENT_VARIABLES: {},
-          "coding_map": {}}
-
+    pj = dict(EMPTY_PROJECT)
     project = False
-
     ffmpeg_recode_process = None
-
-    observationId = ''   # current observation id
-
+    observationId = ""   # current observation id
     timeOffset = 0.0
-
     wrongTimeResponse = ""
 
     confirmSound = False               # if True each keypress will be confirmed by a beep
@@ -340,13 +285,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     alertNoFocalSubject = False        # if True an alert will show up if no focal subject
     trackingCursorAboveEvent = False   # if True the cursor will appear above the current event in events table
     checkForNewVersion = False         # if True BORIS will check for new version every 15 days
+    
+    pause_before_addevent = False      # pause before "Add event" command CTRL + A
+    
     timeFormat = HHMMSS                # 's' or 'hh:mm:ss'
     repositioningTimeOffset = 0
     automaticBackup = 0                # automatic backup interval (0 no backup)
 
     projectChanged = False
-
     liveObservationStarted = False
+    
+    # data structures for external data plot
+    plot_data = {}
+    ext_data_timer_list = []
 
     frame_viewer1_mem_geometry = None
     frame_viewer2_mem_geometry = None
@@ -357,7 +308,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     saveMediaFilePath = True
 
     beep_every = 0
-    
+
     plot_colors = BEHAVIORS_PLOT_COLORS
 
     measurement_w = None
@@ -379,7 +330,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     play_rate_step = 0.1
 
-    currentSubject = ''  # contains the current subject of observation
+    currentSubject = ""  # contains the current subject of observation
 
     detailedObs = {}
 
@@ -391,12 +342,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     # FFmpeg
     allowFrameByFrame = False
-
     memx, memy = -1, -1
 
     # path for ffmpeg/ffmpeg.exe program
-    ffmpeg_bin = ''
-    ffmpeg_cache_dir = ''
+    ffmpeg_bin = ""
+    ffmpeg_cache_dir = ""
     ffmpeg_cache_dir_max_size = 0
     frame_resize = 0
 
@@ -410,14 +360,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     chunk_length = 60  # spectrogram chunk length in seconds
 
     memMedia = ""
-
     close_the_same_current_event = False
-
     tcp_port = 0
-
     cleaningThread = TempDirCleanerThread()
-
     bcm_dict = {}
+    recent_projects = []
 
 
     def __init__(self, availablePlayers, ffmpeg_bin, parent=None):
@@ -450,13 +397,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.setWindowTitle("{} ({})".format(programName, __version__))
 
-        '''
-        try:
-            datadir = sys._MEIPASS
-        except Exception:
-            datadir = os.path.dirname(os.path.realpath(__file__))
-        '''
-
         if os.path.isfile(sys.path[0]):  # for pyinstaller
             datadir = os.path.dirname(sys.path[0])
         else:
@@ -479,9 +419,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.dwObservations.setVisible(False)
         self.dwEthogram.setVisible(False)
         self.dwSubjects.setVisible(False)
+        self.lb_current_media_time.setVisible(False)
         self.lbFocalSubject.setVisible(False)
         self.lbCurrentStates.setVisible(False)
 
+        self.lb_current_media_time.setText("")
         self.lbFocalSubject.setText("")
         self.lbCurrentStates.setText("")
 
@@ -489,9 +431,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         font = QFont()
         font.setPointSize(15)
+        self.lb_current_media_time.setFont(font)
         self.lbFocalSubject.setFont(font)
         self.lbCurrentStates.setFont(font)
 
+        # Statusbar initialisation
         # add label to status bar
         self.lbTime = QLabel()
         self.lbTime.setFrameStyle(QFrame.StyledPanel)
@@ -529,6 +473,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.connections()
 
+
     def create_live_tab(self):
         """
         create tab with widget for live observation
@@ -555,6 +500,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.liveTab.setLayout(self.liveLayout)
         self.toolBox.insertItem(2, self.liveTab, "Live")
 
+
     def menu_options(self):
         """
         enable/disable menu option
@@ -575,11 +521,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     pn = "Unnamed project"
 
         self.setWindowTitle("{}{}{}".format(self.observationId + " - " * (self.observationId != ""),
-                                            pn + (" - "*(pn != "")), programName))
+                                            pn + (" - " * (pn != "")), programName))
 
         # project menu
-        for w in [self.actionEdit_project, self.actionSave_project, self.actionSave_project_as, self.actionClose_project, self.actionSend_project,
-                  self.actionNew_observation]:
+        for w in [self.actionEdit_project, self.actionSave_project, self.actionSave_project_as,
+                  self.actionClose_project, self.actionSend_project, self.actionNew_observation,
+                  self.actionRemove_path_from_media_files]:
             w.setEnabled(flag)
 
         # observations
@@ -666,10 +613,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionFrame_forward.setEnabled(flagObs and (self.playMode == FFMPEG))
 
         # Tools
-        if FLAG_MATPLOTLIB_INSTALLED:
-            self.actionShow_spectrogram.setEnabled(self.playerType == VLC)
-        else:
-            self.actionShow_spectrogram.setEnabled(False)
+        self.actionShow_spectrogram.setEnabled(self.playerType == VLC)
+        self.actionShow_data_files.setEnabled(self.playerType == VLC)
         # geometric measurements
         self.actionDistance.setEnabled(flagObs and (self.playMode == FFMPEG))
         self.actionCoding_pad.setEnabled(flagObs)
@@ -701,6 +646,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionSave_project_as.triggered.connect(self.save_project_as_activated)
         self.actionClose_project.triggered.connect(self.close_project)
 
+        self.actionRemove_path_from_media_files.triggered.connect(self.remove_media_files_path)
         self.actionSend_project.triggered.connect(self.send_project_via_socket)
 
         self.menuCreate_subtitles_2.triggered.connect(self.create_subtitles)
@@ -711,7 +657,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         # menu observations
         self.actionNew_observation.triggered.connect(self.new_observation_triggered)
-        self.actionOpen_observation.triggered.connect(self.open_observation)
+        self.actionOpen_observation.triggered.connect(lambda: self.open_observation("start"))
+        self.actionView_observation.triggered.connect(lambda: self.open_observation("view"))
         self.actionEdit_observation_2.triggered.connect(self.edit_observation)
         self.actionObservationsList.triggered.connect(self.observations_list)
 
@@ -737,11 +684,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionLoad_observations_file.triggered.connect(self.import_observations)
 
         self.actionExportEvents.triggered.connect(self.export_tabular_events)
-
         self.actionExportEventString.triggered.connect(self.export_string_events)
-
         self.actionExport_aggregated_events.triggered.connect(self.export_aggregated_events)
-
         self.actionExport_events_as_Praat_TextGrid.triggered.connect(self.export_state_events_as_textgrid)
 
         self.actionExtract_events_from_media_files.triggered.connect(self.extract_events)
@@ -759,19 +703,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # menu Tools
         self.action_create_modifiers_coding_map.triggered.connect(self.modifiers_coding_map_creator)
         self.action_create_behaviors_coding_map.triggered.connect(self.behaviors_coding_map_creator)
-        
-        # TODO: remove when behaviors coding map ready
-        #self.action_create_behaviors_coding_map.setVisible(False)
-        
 
         self.actionShow_spectrogram.triggered.connect(self.show_spectrogram)
+        self.actionShow_data_files.triggered.connect(self.show_data_files)
         self.actionDistance.triggered.connect(self.distance)
         self.actionBehaviors_coding_map.triggered.connect(self.show_behaviors_coding_map)
-        
-        # TODO: remove when behav coding map ready
-        #self.actionBehaviors_coding_map.setVisible(False)
-        
-        
+
         self.actionCoding_pad.triggered.connect(self.show_coding_pad)
         self.actionSubjects_pad.triggered.connect(self.show_subjects_pad)
         
@@ -780,6 +717,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.actionCreate_transitions_flow_diagram.triggered.connect(self.transitions_dot_script)
         self.actionCreate_transitions_flow_diagram_2.triggered.connect(self.transitions_flow_diagram)
+
+        #self.actionConverters_manager.triggered.connect(self.converters_manager)
 
         # menu Analyze
         self.actionTime_budget.triggered.connect(lambda: self.time_budget("by_behavior"))
@@ -888,8 +827,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         # timer for spectrogram visualization
         self.timer_spectro = QTimer(self)
-        self.timer_spectro.setInterval(50)
+        # TODO check value of interval
+        self.timer_spectro.setInterval(200)
         self.timer_spectro.timeout.connect(self.timer_spectro_out)
+
 
         # timer for timing the live observation
         self.liveTimer = QTimer(self)
@@ -903,203 +844,102 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if self.automaticBackup:
             self.automaticBackupTimer.start(self.automaticBackup * 60000)
 
+
+    def remove_media_files_path(self):
+        """
+        remove path of media files
+        """
+
+        if dialog.MessageDialog(programName, ("Removing the path of media files from the project file is irreversible.<br>"
+                                              "Are you sure to continue?"),
+                                              [YES, NO]) == NO:
+            return
+
+        self.pj = project_functions.remove_media_files_path(self.pj)
+        self.projectChanged = True
+
+
     def irr_cohen_kappa(self):
         """
-        calculate the Inter-rater Reliability index - Cohen's Kappa of 2 observations
+        calculate the Inter-Rater Reliability index - Cohen's Kappa of 2 observations
         https://en.wikipedia.org/wiki/Cohen%27s_kappa
         """
 
         # ask user observations to analyze
-        result, selectedObservations = self.selectObservations(MULTIPLE)
-        if not selectedObservations:
+        result, selected_observations = self.selectObservations(MULTIPLE)
+        if not selected_observations:
             return
-        if len(selectedObservations) != 2:
-            QMessageBox.information(self, programName, "Select 2 observations for IRR calculation")
-            return
-
-        obsid1, obsid2 = selectedObservations
-
-        # check if state events are paired
-        for obsId in [obsid1, obsid2]:
-            r, msg = self.check_state_events_obs(obsId)
-            if not r:
-                QMessageBox.information(self, programName, "Observation: <b>{obsId}</b><br>{msg}".format(obsId=obsId, msg=msg))
-                return
-
-        # ask for subjects to analyze
-        paramPanelWindow = param_panel.Param_panel()
-        paramPanelWindow.setWindowTitle("Select the subjects to analyze")
-        paramPanelWindow.lbBehaviors.setText("Subjects")
-
-        for w in [paramPanelWindow.lwSubjects,
-                  paramPanelWindow.pbSelectAllSubjects, paramPanelWindow.pbUnselectAllSubjects,
-                  paramPanelWindow.pbReverseSubjectsSelection,
-                  paramPanelWindow.lbSubjects, paramPanelWindow.cbIncludeModifiers, paramPanelWindow.cbExcludeBehaviors]:
-            w.setVisible(False)
-        paramPanelWindow.frm_time.setVisible(False)
-
-        paramPanelWindow.item = QListWidgetItem(NO_FOCAL_SUBJECT)
-        paramPanelWindow.item.setCheckState(Qt.Unchecked)
-        paramPanelWindow.lwBehaviors.addItem(paramPanelWindow.item)
-
-        for subject in [self.pj[SUBJECTS][x]["name"] for x in sorted_keys(self.pj[SUBJECTS])]:
-            paramPanelWindow.item = QListWidgetItem(subject)
-            paramPanelWindow.item.setCheckState(Qt.Unchecked)
-            paramPanelWindow.lwBehaviors.addItem(paramPanelWindow.item)
-
-        if paramPanelWindow.exec_():
-            selected_subjects = paramPanelWindow.selectedBehaviors
-        else:
+        if len(selected_observations) < 2:
+            QMessageBox.information(self, programName, "Select almost 2 observations for IRR analysis")
             return
 
-        print(selected_subjects)
-        subjects_to_analyze = {}
-        if NO_FOCAL_SUBJECT in selected_subjects:
-            subjects_to_analyze[""] = {"name": ""}
+        plot_parameters = self.choose_obs_subj_behav_category(selected_observations,
+                                                              maxTime=0,
+                                                              flagShowIncludeModifiers=True,
+                                                              flagShowExcludeBehaviorsWoEvents=False)
 
-        for idx in self.pj[SUBJECTS]:
-            if self.pj[SUBJECTS][idx]["name"] in selected_subjects:
-                subjects_to_analyze[idx] = dict(self.pj[SUBJECTS][idx])
-
-        print("subjects_to_analyze", subjects_to_analyze)
+        if not plot_parameters["selected subjects"] or not plot_parameters["selected behaviors"]:
+            return
 
         # ask for time slice
-        i, ok = QInputDialog.getDouble(self, "IRR", "Time slice (in seconds):", 10.0, 0.001, 86400, 3)
+        i, ok = QInputDialog.getDouble(self, "IRR", "Time slice (in seconds):", 1.0, 0.001, 86400, 3)
         if not ok:
             return
         interval = float2decimal(i)
 
-        StateBehaviorsCodes = [self.pj[ETHOGRAM][x]["code"] for x in [y for y in self.pj[ETHOGRAM]
-                               if STATE in self.pj[ETHOGRAM][y][TYPE].upper()]]
+        ok, msg, db_connector = db_functions.load_aggregated_events_in_db(self.pj,
+                                                           plot_parameters["selected subjects"],
+                                                           selected_observations,
+                                                           plot_parameters["selected behaviors"])
 
-        last_event = max(self.pj[OBSERVATIONS][obsid1][EVENTS][-1][0], self.pj[OBSERVATIONS][obsid2][EVENTS][-1][0])
-        print(last_event)
+        if not ok:
+            self.results = dialog.ResultsWidget()
+            self.results.setWindowTitle("Check state events")
+            self.results.ptText.clear()
+            self.results.ptText.setReadOnly(True)
+            self.results.ptText.appendHtml(msg)
+            self.results.show()
+            return
 
-        total_states = []
-
-        all_subjects = dict(self.pj[SUBJECTS], **{"": {"name": NO_FOCAL_SUBJECT}})
-
-        currentTime = Decimal("0")
-        while currentTime <= last_event:
-
-            for idx in all_subjects:
-                if all_subjects[idx]["name"] not in selected_subjects:
+        cursor = db_connector.cursor()
+        out = ("Cohen's Kappa - Index of Inter-rater Reliability\n\n"
+               "Interval time: {interval:.3f} s\n"
+               "Selected subjects: {selected_subjects}\n\n").format(interval=interval,
+                                                                    selected_subjects=", ".join(plot_parameters["selected subjects"]))
+        mem_done = []
+        irr_results = np.ones((len(selected_observations), len(selected_observations)))
+        
+        for obs_id1 in selected_observations:
+            for obs_id2 in selected_observations:
+                if obs_id1 == obs_id2:
                     continue
+                if set([obs_id1, obs_id2]) not in mem_done:
+                    K, msg = irr.cohen_kappa(cursor,
+                                             obs_id1, obs_id2,
+                                             interval,
+                                             plot_parameters["selected subjects"],
+                                             plot_parameters["include modifiers"])
+                    irr_results[selected_observations.index(obs_id1), selected_observations.index(obs_id2)] = K
+                    irr_results[selected_observations.index(obs_id2), selected_observations.index(obs_id1)] = K
+                    out += msg + "\n=============\n"
+                    mem_done.append(set([obs_id1, obs_id2]))
 
-                print("subject", all_subjects[idx]["name"])
-
-                current_states1 = self.get_current_states_by_subject(StateBehaviorsCodes,
-                                                                     self.pj[OBSERVATIONS][obsid1][EVENTS],
-                                                                     subjects_to_analyze, currentTime)
-                print("current_state1", current_states1)
-
-                if idx in current_states1:
-
-                    s1 = all_subjects[idx]["name"] + ":" + ("+".join(sorted(current_states1[idx])))
-
-                    if s1 not in total_states:
-                        total_states.append(s1)
-
-                current_states2 = self.get_current_states_by_subject(StateBehaviorsCodes,
-                                                                     self.pj[OBSERVATIONS][obsid2][EVENTS],
-                                                                     subjects_to_analyze,
-                                                                     currentTime)
-
-                if idx in current_states2:
-
-                    s2 = all_subjects[idx]["name"] + ":" + ("+".join(sorted(current_states2[idx])))
-
-                    if s2 not in total_states:
-                        total_states.append(s2)
-
-            currentTime += interval
-
-        total_states = sorted(total_states)
-
-        logging.debug("total_states: {}".format(total_states))
-
-        contingency_table = np.zeros((len(total_states), len(total_states)))
-
-        currentTime = Decimal("0")
-        while currentTime < last_event:
-
-            for idx in all_subjects:
-                if all_subjects[idx]["name"] not in selected_subjects:
-                    continue
-
-                current_states1 = self.get_current_states_by_subject(StateBehaviorsCodes,
-                                                                     self.pj[OBSERVATIONS][obsid1][EVENTS],
-                                                                     subjects_to_analyze,
-                                                                     currentTime)
-
-                if idx in current_states1:
-
-                    s1 = all_subjects[idx]["name"] + ":" + ("+".join(sorted(current_states1[idx])))
-
-                current_states2 = self.get_current_states_by_subject(StateBehaviorsCodes,
-                                                                     self.pj[OBSERVATIONS][obsid2][EVENTS],
-                                                                     subjects_to_analyze,
-                                                                     currentTime)
-
-                if idx in current_states2:
-
-                    s2 = all_subjects[idx]["name"] + ":" + ("+".join(sorted(current_states2[idx])))
-
-                if idx in current_states1 and idx in current_states2:
-                    contingency_table[total_states.index(s1), total_states.index(s2)] += 1
-
-            currentTime += interval
-
-        logging.debug("contingency_table: {}".format(contingency_table))
+        out2 = "\t{}\n".format("\t".join(list(selected_observations)))
+        for r in range(irr_results.shape[0]):
+            out2 += "{}\t".format(selected_observations[r])
+            out2 += "\t".join(["%8.6f" % x for x in irr_results[r,:]]) + "\n"
 
         self.results = dialog.ResultsWidget()
-        self.results.setWindowTitle(programName + " - Media file information")
+        self.results.setWindowTitle(programName + " - IRR - Cohen's Kappa analysis results")
         self.results.ptText.setReadOnly(True)
-        out = ""
-        out += "<b>Cohen's Kappa - Index of Inter-rater Reliability</b><br><br>"
-
-        out += "Interval time: <b>{:.3f} s</b><br><br>".format(interval)
-        out += "Selected subjects: <b>{}</b><br><br>".format(", ".join(selected_subjects))
-
-        out += "Observation #1: <b>{}</b><br>".format(obsid1)
-        out += "number of events: <b>{:.0f}</b><br>".format(
-                len([event for event in self.pj[OBSERVATIONS][obsid1][EVENTS]
-                     if (event[EVENT_SUBJECT_FIELD_IDX] in selected_subjects) or
-                        (event[EVENT_SUBJECT_FIELD_IDX] == "" and NO_FOCAL_SUBJECT in selected_subjects)]) / 2)
-
-        out += "Observation length: <b>{:.3f} s</b><br>".format(self.observationTotalMediaLength(obsid1))
-        out += "Number of intervals: <b>{:.0f}</b><br><br>".format(self.observationTotalMediaLength(obsid1) / interval)
-
-        out += "Observation #2: <b>{}</b><br>".format(obsid2)
-        out += "number of events: <b>{:.0f}</b><br>".format(
-                len([event for event in self.pj[OBSERVATIONS][obsid2][EVENTS]
-                     if (event[EVENT_SUBJECT_FIELD_IDX] in selected_subjects) or
-                        (event[EVENT_SUBJECT_FIELD_IDX] == "" and NO_FOCAL_SUBJECT in selected_subjects)]) / 2)
-
-        out += "Observation length: <b>{:.3f} s</b><br>".format(self.observationTotalMediaLength(obsid2))
-        out += "Number of intervals: <b>{:.0f}</b><br><br>".format(self.observationTotalMediaLength(obsid2) / interval)
-
-        cols_sums = contingency_table.sum(axis=0)
-        rows_sums = contingency_table.sum(axis=1)
-        overall_total = contingency_table.sum()
-        print("overall_total", overall_total)
-        agreements = sum(contingency_table.diagonal())
-        print("agreements", agreements)
-
-        sum_ef = 0
-        for idx in range(len(total_states)):
-            sum_ef += rows_sums[idx] * cols_sums[idx] / overall_total
-
-        logging.debug("sum_ef {}".format(sum_ef))
-
-        K = (agreements - sum_ef) / (overall_total - sum_ef)
-
-        out += "K: <b>{:.3f}</b><br>".format(K)
-        self.results.ptText.appendHtml(out)
+        if len(selected_observations) == 2:
+            self.results.ptText.appendPlainText(out)
+        else:
+            self.results.ptText.appendPlainText(out2)
         self.results.show()
 
-        return
 
+    # TODO: externalize function
     def view_behavior(self):
         """
         show details of selected behavior
@@ -1145,6 +985,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 self.results.ptText.appendHtml(txt)
                 self.results.show()
+
 
     def send_project_via_socket(self):
         """
@@ -1260,6 +1101,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 received += data
             s.close
 
+
     def recode_resize_video(self):
         """
         re-encode video with ffmpeg
@@ -1313,6 +1155,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.w.label.setText("This operation can be long. Be patient...\n\n" + "\n".join(fileNames))
             self.w.show()
 
+            # check in platform win and program frozen by pyinstaller
             if sys.platform.startswith("win") and getattr(sys, "frozen", False):
                 app.processEvents()
                 ffmpeg_recode(fileNames, horiz_resol, ffmpeg_bin)
@@ -1336,18 +1179,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.keyPressEvent(q)
 
 
-    def signal_from_coding_pad(self, event):
-        """
-        receive signal from coding pad
-        """
-        self.keyPressEvent(event)
-
     def close_signal_from_coding_pad(self, geom):
         """
         save coding pad geometry after close
         """
         self.codingpad_geometry_memory = geom
-        print(geom)
 
 
     def click_signal_from_subjects_pad(self, subject):
@@ -1393,7 +1229,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             filtered_behaviors = [self.twEthogram.item(i, 1).text() for i in range(self.twEthogram.rowCount())]
             self.codingpad = coding_pad.CodingPad(self.pj, filtered_behaviors)
             self.codingpad.setWindowFlags(Qt.WindowStaysOnTopHint)
-            self.codingpad.sendEventSignal.connect(self.signal_from_coding_pad)
+            #self.codingpad.sendEventSignal.connect(self.signal_from_coding_pad)
+            self.codingpad.sendEventSignal.connect(self.signal_from_widget)
             self.codingpad.clickSignal.connect(self.click_signal_from_coding_pad)
             self.codingpad.close_signal.connect(self.close_signal_from_coding_pad)
             self.codingpad.show()
@@ -1602,8 +1439,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         flagUnpairedEventFound = False
 
-        cursor = self.loadEventsInDB(plot_parameters["selected subjects"], selectedObservations,
-                                     plot_parameters["selected behaviors"])
+        cursor = db_functions.load_events_in_db(self.pj, plot_parameters["selected subjects"],
+                                                selectedObservations, plot_parameters["selected behaviors"])
 
         for obsId in selectedObservations:
 
@@ -1706,7 +1543,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                                          shell=True)
                                     out, error = p.communicate()
 
-        self.statusbar.showMessage("Sequences extracted to {} directory".format(exportDir), 0)
 
     def generate_spectrogram(self):
         """
@@ -1714,10 +1550,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """
 
         # check temp dir for images from ffmpeg
-        if not self.ffmpeg_cache_dir:
-            tmp_dir = tempfile.gettempdir()
-        else:
-            tmp_dir = self.ffmpeg_cache_dir
+        tmp_dir = self.ffmpeg_cache_dir if self.ffmpeg_cache_dir else tempfile.gettempdir()
 
         w = recode_widget.Info_widget()
         w.lwi.setVisible(False)
@@ -1745,6 +1578,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             else:
                 QMessageBox.warning(self, programName, "<b>{}</b> file not found".format(media))
+
 
     def show_spectrogram(self):
         """
@@ -1795,12 +1629,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 # connect signal from spectrogram class to testsignal function to receive keypress events
                 self.spectro.setWindowFlags(Qt.WindowStaysOnTopHint)
-                self.spectro.sendEvent.connect(self.signal_from_spectrogram)
+                self.spectro.sendEvent.connect(self.signal_from_widget)
                 self.spectro.show()
                 self.timer_spectro.start()
 
             if self.playerType == VLC and self.playMode == VLC and not flagPaused:
                 self.play_video()
+
 
     def timer_spectro_out(self):
         """
@@ -1820,7 +1655,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         if self.playerType == VLC:
             if self.playMode == VLC:
-
                 currentMediaTime = self.mediaplayer.get_time()
 
             if self.playMode == FFMPEG:
@@ -1864,6 +1698,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 return
 
+            logging.debug("current chunk file name: {}".format(currentChunkFileName))
             self.spectro.pixmap.load(currentChunkFileName)
 
             self.spectro.setWindowTitle("Spectrogram - {}".format(
@@ -1874,13 +1709,22 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.spectro.item = QGraphicsPixmapItem(self.spectro.pixmap)
 
             self.spectro.scene.addItem(self.spectro.item)
-            self.spectro.item.setPos(self.spectro.scene.width()//2, 0)
+            self.spectro.item.setPos(self.spectro.scene.width() // 2, 0)
 
         get_time = (currentMediaTime % (self.chunk_length * 1000) / (self.chunk_length*1000))
 
         self.spectro.item.setPos(self.spectro.scene.width() // 2 - int(get_time * self.spectro.w), 0)
 
         self.spectro.memChunk = currentChunk
+
+
+    def show_data_files(self):
+        """
+        show plot of data files (if any)
+        """
+        for idx in self.plot_data:
+            self.plot_data[idx].show()
+
 
     def modifiers_coding_map_creator(self):
         """
@@ -1894,9 +1738,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def behaviors_coding_map_creator_signal_addtoproject(self, behav_coding_map):
         """
-        input:
-        behav_coding_map (dict)
         add the behav coding map received from behav_coding_map_creator to current project
+        
+        Args:
+            behav_coding_map (dict): 
         """
 
         if not self.project:
@@ -1941,11 +1786,17 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.mapCreatorWindow.resize(CODING_MAP_RESIZE_W, CODING_MAP_RESIZE_H)
         self.mapCreatorWindow.show()
 
-    def load_observation(self, obsId):
+
+    def load_observation(self, obsId, mode="start"):
         """
         load observation obsId
+    
+        Args:
+            obsId (str): observation id
+            mode (str): "start" to start observation
+                        "view"  to start observation
         """
-        print(obsId)
+
         if obsId in self.pj[OBSERVATIONS]:
 
             self.observationId = obsId
@@ -1957,11 +1808,17 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             if self.pj[OBSERVATIONS][self.observationId][TYPE] in [MEDIA]:
 
-                if not self.initialize_new_observation_vlc():
-                    self.observationId = ""
-                    self.twEvents.setRowCount(0)
-                    self.menu_options()
-                    return "Error: loading observation problem"
+                if mode == "start":
+                    if not self.initialize_new_observation_vlc():
+                        self.observationId = ""
+                        self.twEvents.setRowCount(0)
+                        self.menu_options()
+                        return "Error: loading observation problem"
+
+                if mode == "view":
+                    self.playerType = VIEWER
+                    self.playMode = ""
+                    self.dwObservations.setVisible(True)
 
             self.menu_options()
             # title of dock widget  “  ”
@@ -1971,9 +1828,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         else:
             return "Error: Observation not found"
 
-    def open_observation(self):
+
+    def open_observation(self, mode):
         """
-        open an observation
+        start an observation
+        
+        Args:
+            mode (str): "start" to start observation
+                        "view" to start observation
         """
 
         # check if current observation must be closed to open a new one
@@ -1989,9 +1851,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         result, selectedObs = self.selectObservations(OPEN)
 
         if selectedObs:
-            return self.load_observation(selectedObs[0])
+            return self.load_observation(selectedObs[0], mode)
         else:
             return ""
+
 
     def edit_observation(self):
         """
@@ -2012,65 +1875,23 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if selectedObs:
             self.new_observation(mode=EDIT, obsId=selectedObs[0])
 
-    def check_state_events_obs(self, obsId):
-
-        # check if behaviors are defined as "state event"
-        event_types = {self.pj[ETHOGRAM][idx]["type"] for idx in self.pj[ETHOGRAM]}
-
-        if not event_types or event_types == {"Point event"}:
-            return (True, "No behavior is defined as `State event`")
-
-        out = ""
-        flagStateEvent = False
-        subjects = [event[EVENT_SUBJECT_FIELD_IDX] for event in self.pj[OBSERVATIONS][obsId][EVENTS]]
-        ethogram_behaviors = {self.pj[ETHOGRAM][idx]["code"] for idx in self.pj[ETHOGRAM]}
-
-        for subject in sorted(set(subjects)):
-
-            behaviors = [event[EVENT_BEHAVIOR_FIELD_IDX] for event in self.pj[OBSERVATIONS][obsId][EVENTS]
-                         if event[EVENT_SUBJECT_FIELD_IDX] == subject]
-
-            for behavior in sorted(set(behaviors)):
-                if behavior not in ethogram_behaviors:
-                    return (False, "The behaviour <b>{}</b> does not exist more in the ethogram.<br>".format(behavior))
-                else:
-                    if "STATE" in self.eventType(behavior).upper():
-                        flagStateEvent = True
-                        lst, memTime = [], {}
-                        for event in [event for event in self.pj[OBSERVATIONS][obsId][EVENTS]
-                                      if event[EVENT_BEHAVIOR_FIELD_IDX] == behavior and
-                                      event[EVENT_SUBJECT_FIELD_IDX] == subject]:
-                            behav_modif = [event[EVENT_BEHAVIOR_FIELD_IDX], event[EVENT_MODIFIER_FIELD_IDX]]
-                            if behav_modif in lst:
-                                lst.remove(behav_modif)
-                                del memTime[str(behav_modif)]
-                            else:
-                                lst.append(behav_modif)
-                                memTime[str(behav_modif)] = event[EVENT_TIME_FIELD_IDX]
-    
-                        for event in lst:
-                            out += ("""The behavior <b>{behavior}</b> {modifier}is not PAIRED for subject"""
-                                    """ "<b>{subject}</b>" at <b>{time}</b><br>""").format(
-                                          behavior=behavior,
-                                          modifier=("(modifier "+ event[1] + ") ") if event[1] else "",
-                                          subject=subject if subject else NO_FOCAL_SUBJECT,
-                                          time=memTime[str(event)] if self.timeFormat == S else seconds2time(memTime[str(event)]))
-
-        return (False, out) if out else (True, "All state events are PAIRED<br>")
-
 
     def check_state_events(self, mode="all"):
         """
-        check state events for each subject in current observation
-        if no current observation check all observations
-        check if number is odd
+        check state events for each subject
+        use check_state_events_obs function
+        
+        Args:
+            mode (str): current: check current observation / all: ask user to select observations
         """
 
         tot_out = ""
         if mode == "current":
             if self.observationId:
-                r, msg = self.check_state_events_obs(self.observationId)
-                tot_out = "<strong>{}</strong><br>{}<br><br>".format(self.observationId, msg)
+                r, msg = project_functions.check_state_events_obs(self.observationId, self.pj[ETHOGRAM],
+                                                                  self.pj[OBSERVATIONS][self.observationId], self.timeFormat)
+                
+                tot_out = "Observation: <strong>{}</strong><br>{}<br><br>".format(self.observationId, msg)
 
         if mode == "all":
             if not self.pj[OBSERVATIONS]:
@@ -2085,7 +1906,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 return
     
             for obsId in sorted(selectedObservations):
-                r, msg = self.check_state_events_obs(obsId)
+                r, msg = project_functions.check_state_events_obs(obsId, self.pj[ETHOGRAM],
+                                                                  self.pj[OBSERVATIONS][obsId], self.timeFormat)
+
                 tot_out += "<strong>{}</strong><br>{}<br>".format(obsId, msg)
 
         self.results = dialog.ResultsWidget()
@@ -2135,6 +1958,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                         ("The observation <b>{}</b> is running!<br>"
                                          "Close it before editing.").format(self.observationId))
 
+
     def actionCheckUpdate_activated(self, flagMsgOnlyIfNew=False):
         """
         check BORIS web site for updates
@@ -2148,19 +1972,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                        """http://www.boris.unito.it</a> to install it.""").format(lastVersion)
             else:
                 msg = "The version you are using is the last one: <b>{}</b>".format(__version__)
-
             newsURL = "http://www.boris.unito.it/static/news.dat"
             news = urllib.request.urlopen(newsURL).read().strip().decode("utf-8")
-
             self.saveConfigFile(lastCheckForNewVersion=int(time.mktime(time.localtime())))
-
             QMessageBox.information(self, programName, msg)
-
             if news:
                 QMessageBox.information(self, programName, news)
-
         except:
             QMessageBox.warning(self, programName, "Can not check for updates...")
+
 
     def jump_to(self):
         """
@@ -2187,7 +2007,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                     if self.FFmpegGlobalFrame > 0:
                         self.FFmpegGlobalFrame -= 1
-                        if self.FFmpegGlobalFrame2 > 0:
+                        if self.second_player() and self.FFmpegGlobalFrame2 > 0:
                             self.FFmpegGlobalFrame2 -= 1
                     self.ffmpegTimerOut()
 
@@ -2239,6 +2059,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                     self.timer_out()
                     self.timer_spectro_out()
+                    #self.timer_plot_data_out()
+
 
     def previous_media_file(self):
         """
@@ -2284,12 +2106,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 self.timer_out()
                 self.timer_spectro_out()
+                #self.timer_plot_data_out()
 
                 # no subtitles
                 # self.mediaplayer.video_set_spu(0)
 
             if hasattr(self, "spectro"):
                 self.spectro.memChunk = -1
+
 
     def next_media_file(self):
         """
@@ -2336,11 +2160,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 self.timer_out()
                 self.timer_spectro_out()
+                #self.timer_plot_data_out()
                 # no subtitles
                 # self.mediaplayer.video_set_spu(0)
 
             if hasattr(self, "spectro"):
                 self.spectro.memChunk = -1
+
 
     def setVolume(self):
         """
@@ -2349,12 +2175,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.mediaplayer.audio_set_volume(self.volumeslider.value())
 
+
     def setVolume2(self):
         """
         set volume for player #2
         """
 
         self.mediaplayer2.audio_set_volume(self.volumeslider2.value())
+
 
     def automatic_backup(self):
         """
@@ -2364,6 +2192,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if self.observationId:
             logging.info("automatic backup")
             self.save_project_activated()
+
 
     def update_subject(self, subject):
         """
@@ -2377,6 +2206,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.currentSubject = subject
             self.lbSubject.setText("Subject: <b>{}</b>".format(self.currentSubject))
             self.lbFocalSubject.setText(" Focal subject: <b>{}</b>".format(self.currentSubject))
+
 
     def preferences(self):
         """
@@ -2418,6 +2248,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         preferencesWindow.cbTrackingCursorAboveEvent.setChecked(self.trackingCursorAboveEvent)
         # check for new version
         preferencesWindow.cbCheckForNewVersion.setChecked(self.checkForNewVersion)
+        
+        # pause before add event
+        preferencesWindow.cb_pause_before_addevent.setChecked(self.pause_before_addevent)
 
         # FFmpeg for frame by frame mode
         preferencesWindow.lbFFmpegPath.setText("FFmpeg path: {}".format(self.ffmpeg_bin))
@@ -2488,6 +2321,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             self.checkForNewVersion = preferencesWindow.cbCheckForNewVersion.isChecked()
 
+            self.pause_before_addevent = preferencesWindow.cb_pause_before_addevent.isChecked()
+
             if self.observationId:
                 self.loadEventsInTW(self.observationId)
                 self.display_timeoffset_statubar(self.pj[OBSERVATIONS][self.observationId][TIME_OFFSET])
@@ -2523,14 +2358,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.spectrogramHeight = preferencesWindow.sbSpectrogramHeight.value()
 
             if self.playMode == FFMPEG:
+
                 if self.detachFrameViewer:
-                    if hasattr(self, "lbFFmpeg"):
-                        self.lbFFmpeg.clear()
-                    if self.observationId and self.playerType == VLC and self.playMode == FFMPEG:
-                        self.create_frame_viewer()
-                        self.FFmpegGlobalFrame -= 1
-                        self.ffmpegTimerOut()
-                else:
+                    if hasattr(self, "measurement_w") and self.measurement_w is not None and self.measurement_w.isVisible():
+                        QMessageBox.warning(self, programName, "The frame viewer can not be detached when geometric measurements are active")
+                        self.detachFrameViewer = False
+                    else:
+                        if hasattr(self, "lbFFmpeg"):
+                            self.lbFFmpeg.clear()
+                        if self.observationId and self.playerType == VLC and self.playMode == FFMPEG:
+                            self.create_frame_viewer()
+                            self.FFmpegGlobalFrame -= 1
+                            self.ffmpegTimerOut()
+                else: # attach frame viewer
                     if hasattr(self, "frame_viewer1"):
                         self.frame_viewer1_mem_geometry = self.frame_viewer1.geometry()
                         del self.frame_viewer1
@@ -2551,16 +2391,17 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             self.saveConfigFile()
 
+
     def getCurrentMediaByFrame(self, player, requiredFrame, fps):
         """
-        get:
-        player
-        required frame
-        fps
+        Args:
+            player (str): player
+            requiredFrame (int): required frame
+            fps (float): FPS
 
         returns:
-        currentMedia
-        frameCurrentMedia
+            currentMedia
+            frameCurrentMedia
         """
         currentMedia, frameCurrentMedia = "", 0
         frameMs = 1000 / fps
@@ -2570,6 +2411,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 frameCurrentMedia = requiredFrame - sum(self.duration[0:idx]) / frameMs
                 break
         return currentMedia, round(frameCurrentMedia)
+
 
     def getCurrentMediaByTime(self, player, obsId, globalTime):
         """
@@ -2592,10 +2434,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         return currentMedia, round(currentMediaTime/1000, 3)
 
+
     def second_player(self):
         """
 
-        :return: True if second player else False
+        Returns:
+            bool: True if second player else False
         """
         if not self.observationId:
             return False
@@ -2604,6 +2448,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return True
         else:
             return False
+
 
     def create_frame_viewer(self):
         """
@@ -2629,6 +2474,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 else:
                     self.frame_viewer2.setGeometry(150, 150, 256, 256)
 
+
     def ffmpegTimerOut(self):
         """
         triggered when frame-by-frame mode is activated:
@@ -2639,16 +2485,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         fps = list(self.fps.values())[0]
 
-        logging.debug("fps {0}".format(fps))
+        logging.debug("fps {}".format(fps))
 
         frameMs = 1000 / fps
 
-        logging.debug("framMs {0}".format(frameMs))
+        logging.debug("framMs {}".format(frameMs))
 
         requiredFrame = self.FFmpegGlobalFrame + 1
 
-        logging.debug("required frame 1: {0}".format(requiredFrame))
-        logging.debug("sum self.duration1 {0}".format(sum(self.duration)))
+        logging.debug("required frame 1: {}".format(requiredFrame))
+        logging.debug("sum self.duration1 {}".format(sum(self.duration)))
 
         # check if end of last media
         if requiredFrame * frameMs >= sum(self.duration):
@@ -2656,19 +2502,25 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return
 
         currentMedia, frameCurrentMedia = self.getCurrentMediaByFrame(PLAYER1, requiredFrame, fps)
+
+        current_media_full_path = project_functions.media_full_path(currentMedia, self.projectFileName)
+
+        logging.debug("current media 1: {}".format(currentMedia))
         logging.debug("frame current media 1: {}".format(frameCurrentMedia))
 
-        if ("visualize_spectrogram" in self.pj[OBSERVATIONS][self.observationId] and
-                self.pj[OBSERVATIONS][self.observationId]["visualize_spectrogram"]):
-            self.timer_spectro_out()
+        # plot spectro
+        self.timer_spectro_out()
+
+        # plot external data files
 
         md5FileName = hashlib.md5(currentMedia.encode("utf-8")).hexdigest()
 
         if "BORIS@{md5FileName}-{second}".format(md5FileName=md5FileName,
-                                                 second=int(frameCurrentMedia / fps)) not in self.imagesList:
+                                                 second=int((frameCurrentMedia -1)/ fps)) not in self.imagesList:
 
-            extract_frames(self.ffmpeg_bin, int(frameCurrentMedia / fps),
-                           currentMedia,
+            extract_frames(self.ffmpeg_bin,
+                           int((frameCurrentMedia -1) / fps),
+                           current_media_full_path,
                            str(round(fps) + 1),
                            self.imageDirectory,
                            md5FileName,
@@ -2695,10 +2547,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         logging.debug("image1: {}".format(img))
         if not os.path.isfile(img):
-            logging.warning("image 1 not found: {0}".format(img))
+            logging.warning("image 1 not found: {} {} {}".format(img, frameCurrentMedia, int(frameCurrentMedia / fps)))
             extract_frames(self.ffmpeg_bin,
                            int(frameCurrentMedia / fps),
-                           currentMedia,
+                           current_media_full_path,
                            str(round(fps) + 1),
                            self.imageDirectory,
                            md5FileName,
@@ -2741,10 +2593,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                             self.pj[OBSERVATIONS][self.observationId][TIME_OFFSET_SECOND_PLAYER] * fps)
 
             currentMedia2, frameCurrentMedia2 = self.getCurrentMediaByFrame(PLAYER2, requiredFrame2, fps)
+            current_media_full_path2 = project_functions.media_full_path(currentMedia2, self.projectFileName)
+            
             md5FileName2 = hashlib.md5(currentMedia2.encode("utf-8")).hexdigest()
             if "BORIS@{md5FileName}-{second}".format(md5FileName=md5FileName2,
                                                      second=int(frameCurrentMedia2 / fps)) not in self.imagesList:
-                extract_frames(self.ffmpeg_bin, int(frameCurrentMedia2 / fps), currentMedia2, str(round(fps) + 1),
+                extract_frames(self.ffmpeg_bin, int(frameCurrentMedia2 / fps), current_media_full_path2, str(round(fps) + 1),
                                self.imageDirectory, md5FileName2, self.frame_bitmap_format.lower(), self.frame_resize)
 
                 self.imagesList.update([f.replace(self.imageDirectory + os.sep, "").split("_")[0] for f in
@@ -2765,7 +2619,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 logging.warning("image 2 not found: {0}".format(img2))
                 extract_frames(self.ffmpeg_bin,
                                int(frameCurrentMedia2 / fps),
-                               currentMedia2,
+                               current_media_full_path2,
                                str(round(fps) + 1),
                                self.imageDirectory,
                                md5FileName2,
@@ -2791,7 +2645,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.lbFFmpeg.setPixmap(self.pixmap.scaled(self.lbFFmpeg.size(), Qt.KeepAspectRatio))
 
         # redraw measurements from previous frames
-        if self.measurement_w:
+
+        if hasattr(self, "measurement_w") and self.measurement_w is not None and self.measurement_w.isVisible():
             if self.measurement_w.cbPersistentMeasurements.isChecked():
                 for frame in self.measurement_w.draw_mem:
 
@@ -2834,12 +2689,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         currentTime = self.getLaps() * 1000
 
-        self.lbTime.setText("{currentMediaName}: <b>{currentTime} / {totalTime}</b> frame: <b>{currentFrame}</b>".format(
+        time_str = "{currentMediaName}: <b>{currentTime} / {totalTime}</b> frame: <b>{currentFrame}</b>".format(
                              currentMediaName=os.path.basename(currentMedia),
                              currentTime=self.convertTime(currentTime / 1000),
                              totalTime=self.convertTime(Decimal(self.mediaplayer.get_length() / 1000)),
                              currentFrame=round(self.FFmpegGlobalFrame)
-                             ))
+                             )
+        self.lbTime.setText(time_str)
+        self.lb_current_media_time.setText(time_str)
 
         # extract State events
         StateBehaviorsCodes = [self.pj[ETHOGRAM][x]["code"] for x in [y for y in self.pj[ETHOGRAM]
@@ -2871,13 +2728,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # show current states
         if self.currentSubject:
             # get index of focal subject (by name)
-            idx = [idx for idx in self.pj[SUBJECTS] if self.pj[SUBJECTS][idx]['name'] == self.currentSubject][0]
+            idx = [idx for idx in self.pj[SUBJECTS] if self.pj[SUBJECTS][idx]["name"] == self.currentSubject][0]
             self.lbCurrentStates.setText("%s" % (", ".join(self.currentStates[idx])))
         else:
             self.lbCurrentStates.setText("%s" % (", ".join(self.currentStates[""])))
 
         # show selected subjects
-        self.show_current_states_in_subjects_table()        
+        self.show_current_states_in_subjects_table()
         '''
         for idx in sorted_keys(self.pj[SUBJECTS]):
             self.twSubjects.item(int(idx), len(subjectsFields)).setText(",".join(self.currentStates[idx]))
@@ -2886,20 +2743,27 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # show tracking cursor
         self.get_events_current_row()
 
+
     def close_measurement_widget(self):
         self.measurement_w.close()
-        self.measurement_w = None
+
 
     def clear_measurements(self):
         if self.FFmpegGlobalFrame > 1:
             self.FFmpegGlobalFrame -= 1
             self.ffmpegTimerOut()
 
+
     def distance(self):
         """
         active the geometric measurement window
         """
-        import measurement_widget
+        
+        if self.detachFrameViewer:
+            QMessageBox.warning(self, programName, ("The geometric measurement is only available when the frames viewer is not detached\n"
+                                                    "See Preferences > Frame-by-frame mode > Detach frame viewer") )
+            return
+
         self.measurement_w = measurement_widget.wgMeasurement(logging.getLogger().getEffectiveLevel())
         self.measurement_w.draw_mem = {}
         self.measurement_w.setWindowFlags(Qt.WindowStaysOnTopHint)
@@ -2923,6 +2787,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         painter.end()
         self.lbFFmpeg.update()
 
+
     def draw_line(self, x1, y1, x2, y2, color):
         """
         draw line on frame-by-frame image
@@ -2934,11 +2799,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         painter.end()
         self.lbFFmpeg.update()
 
+
     def getPoslbFFmpeg(self, event):
         """
         return click position on frame and distance between 2 last clicks
         """
-        if self.measurement_w:
+        #if self.measurement_w:
+
+        if hasattr(self, "measurement_w") and self.measurement_w is not None and self.measurement_w.isVisible():
             x = event.pos().x()
             y = event.pos().y()
 
@@ -3143,41 +3011,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.vboxlayout.insertLayout(1, self.video2layout)
 
-    def check_if_media_available(self):
-        """
-        check if every media available for observationId
-        """
-
-        if PLAYER1 not in self.pj[OBSERVATIONS][self.observationId][FILE]:
-            return False
-
-        # if type(self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER1]) != type([]):
-        if not isinstance(self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER1], list):
-            return False
-
-        if not self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER1]:
-            return False
-
-        for mediaFile in self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER1]:
-            if not os.path.isfile(mediaFile):
-                return False
-
-        if PLAYER2 in self.pj[OBSERVATIONS][self.observationId][FILE]:
-
-            # if type(self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER2]) != type([]):
-            if not isinstance(self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER2], list):
-                return False
-
-            if self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER2]:
-                for mediaFile in self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER2]:
-                    if not os.path.isfile(mediaFile):
-                        return False
-        return True
 
     def check_if_media_in_project_directory(self):
 
         try:
-            for player in [PLAYER1, PLAYER2]:
+            for player in ALL_PLAYERS:
                 for mediaFile in self.pj[OBSERVATIONS][self.observationId][FILE][player]:
                     if not os.path.isfile(os.path.dirname(self.projectFileName) + os.sep + os.path.basename(mediaFile)):
                         return False
@@ -3185,6 +3023,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return False
         return True
 
+        
 
     def initialize_new_observation_vlc(self):
         """
@@ -3195,19 +3034,24 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         useMediaFromProjectDirectory = NO
 
-        if not self.check_if_media_available():
+        #if not self.check_if_media_available():
+        ok, msg = project_functions.check_if_media_available(self.pj[OBSERVATIONS][self.observationId],
+                                                          self.projectFileName)
+        if not ok:
 
+            '''
             if self.check_if_media_in_project_directory():
 
-                useMediaFromProjectDirectory = dialog.MessageDialog(programName, """Media file was/were not found in its/their original path(s) but in project directory.<br>
-                Do you want to convert media file paths?""", [YES, NO])
+                useMediaFromProjectDirectory = dialog.MessageDialog(programName, ("Media file was/were not found in its/their original path(s) "
+                                                                                  "but in project directory.<br> "
+                                                                                  "Do you want to convert media file paths?"), [YES, NO])
 
                 if useMediaFromProjectDirectory == NO:
-                    QMessageBox.warning(self, programName, ("""The observation will be opened in VIEW mode.<br>"""
-                                                            """It will not be allowed to log events.<br>"""
-                                                            """Modify the media path to point an existing media file"""
-                                                            """ to log events or copy media file in the BORIS project"""
-                                                            """ directory."""),
+                    QMessageBox.warning(self, programName, ("The observation will be opened in VIEW mode.<br>"
+                                                            "It will not be possible to log events.<br>"
+                                                            "Modify the media path to point an existing media file "
+                                                            "to log events or copy media file in the BORIS project "
+                                                            "directory."),
                                         QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
 
                     self.playerType = VIEWER
@@ -3216,18 +3060,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     return True
 
             else:
-                QMessageBox.critical(self, programName, ("A media file was not found!<br>The observation will be"
-                                                         " opened in VIEW mode.<br>"
-                                                         "It will not be allowed to log events.<br>"
+            '''
+            QMessageBox.critical(self, programName, msg + ("<br><br>The observation will be opened in VIEW mode.<br>"
+                                                         "It will not be possible to log events.<br>"
                                                          "Modify the media path to point an existing media file "
                                                          "to log events or copy media file in the BORIS project directory."),
-                                     QMessageBox.Ok | QMessageBox.Default,
-                                     QMessageBox.NoButton)
+                                 QMessageBox.Ok | QMessageBox.Default,
+                                 QMessageBox.NoButton)
 
-                self.playerType = VIEWER
-                self.playMode = ''
-                self.dwObservations.setVisible(True)
-                return True
+            self.playerType = VIEWER
+            self.playMode = ""
+            self.dwObservations.setVisible(True)
+            return True
 
         # check if media list player 1 contains more than 1 media
         if (len(self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER1]) > 1 and
@@ -3237,12 +3081,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                                     "are loaded in the first media player"))
             return False
 
-        self.playerType = VLC
-        self.playMode = VLC
+        self.playerType, self.playMode = VLC, VLC
         self.fps = {}
         self.toolBar.setEnabled(False)
         self.dwObservations.setVisible(True)
         self.toolBox.setVisible(True)
+        self.lb_current_media_time.setVisible(True)
         self.lbFocalSubject.setVisible(True)
         self.lbCurrentStates.setVisible(True)
 
@@ -3255,12 +3099,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # add all media files to media list
         self.simultaneousMedia = False
 
+        '''
         if useMediaFromProjectDirectory == YES:
             for idx, mediaFile in enumerate(self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER1]):
                 self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER1][idx] = (os.path.dirname(self.projectFileName) +
                                                                                  os.sep +
                                                                                  os.path.basename(mediaFile))
                 self.projectChanged = True
+        '''
 
         for mediaFile in self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER1]:
             logging.debug("media file: {}".format(mediaFile))
@@ -3269,7 +3115,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             except AttributeError:
                 self.initialize_video_tab()
 
-            media = self.instance.media_new(mediaFile)
+            media_full_path = project_functions.media_full_path(mediaFile, self.projectFileName)
+            media = self.instance.media_new(media_full_path)
             media.parse()
 
             # media duration
@@ -3278,7 +3125,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 mediaFPS = self.pj[OBSERVATIONS][self.observationId]["media_info"]["fps"][mediaFile]
             except:
                 logging.debug("media_info key not found")
-                nframe, videoTime, videoDuration, fps, hasVideo, hasAudio = accurate_media_analysis(self.ffmpeg_bin, mediaFile)
+                nframe, videoTime, videoDuration, fps, hasVideo, hasAudio = accurate_media_analysis(self.ffmpeg_bin, media_full_path)
                 if "media_info" not in self.pj[OBSERVATIONS][self.observationId]:
                     self.pj[OBSERVATIONS][self.observationId]["media_info"] = {"length": {}, "fps": {}}
                     if "length" not in self.pj[OBSERVATIONS][self.observationId]["media_info"]:
@@ -3312,10 +3159,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         # for mac always embed player
         if sys.platform == "darwin":  # for MacOS
-            
-            print("video frame winid", self.videoframe.winId())
-            print("int video frame winid", int(self.videoframe.winId()))
-            
             self.mediaplayer.set_nsobject(int(self.videoframe.winId()))
 
 
@@ -3374,7 +3217,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 # add media file
                 for mediaFile in self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER2]:
-                    media = self.instance.media_new(mediaFile)
+
+                    media_full_path = project_functions.media_full_path(mediaFile, self.projectFileName)
+                    media = self.instance.media_new(media_full_path)
                     media.parse()
 
                     # media duration
@@ -3383,7 +3228,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                         mediaFPS = self.pj[OBSERVATIONS][self.observationId]["media_info"]["fps"][mediaFile]
                     except:
                         logging.debug("media_info key not found")
-                        nframe, videoTime, videoDuration, fps, hasVideo, hasAudio = accurate_media_analysis(self.ffmpeg_bin, mediaFile)
+                        nframe, videoTime, videoDuration, fps, hasVideo, hasAudio = accurate_media_analysis(self.ffmpeg_bin, media_full_path)
                         if "media_info" not in self.pj[OBSERVATIONS][self.observationId]:
                             self.pj[OBSERVATIONS][self.observationId]["media_info"] = {"length": {}, "fps": {}}
                             if "length" not in self.pj[OBSERVATIONS][self.observationId]["media_info"]:
@@ -3494,9 +3339,89 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                                                                                    self.spectrogramHeight))
             # connect signal from spectrogram class to testsignal function to receive keypress events
             self.spectro.setWindowFlags(Qt.WindowStaysOnTopHint)
-            self.spectro.sendEvent.connect(self.signal_from_spectrogram)
+            self.spectro.sendEvent.connect(self.signal_from_widget)
             self.spectro.show()
             self.timer_spectro.start()
+
+
+
+        # external data plot
+        if PLOT_DATA in self.pj[OBSERVATIONS][self.observationId] and self.pj[OBSERVATIONS][self.observationId][PLOT_DATA]:
+
+            self.plot_data = {}
+            self.ext_data_timer_list = []
+
+            count = 0
+
+            for idx in self.pj[OBSERVATIONS][self.observationId][PLOT_DATA]:
+                
+                if count == 0:
+                    
+                    w1 = plot_data_module.Plot_data(self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["file_path"],
+                                                                 int(self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["time_interval"]),
+                                                                 int(self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["time_offset"]),
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["color"],
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["title"],
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["variable_name"],
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["columns"],
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["substract_first_value"],
+                                                                 self.pj[CONVERTERS] if CONVERTERS in self.pj else {},
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["converters"],
+                                                                 log_level=logging.getLogger().getEffectiveLevel()
+                                                                 )
+
+                    if w1.error_msg:
+                        QMessageBox.critical(self, programName, "Impossibile to plot data from file {}:\n{}".format(os.path.basename(self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["file_path"]),
+                                                                                                             w1.error_msg))
+                        del w1
+                        return False
+
+                    w1.setWindowFlags(Qt.WindowStaysOnTopHint)
+                    w1.sendEvent.connect(self.signal_from_widget)
+
+                    w1.show()
+
+                    self.ext_data_timer_list.append(QTimer())
+                    self.ext_data_timer_list[-1].setInterval(w1.time_out)
+                    self.ext_data_timer_list[-1].timeout.connect(lambda: self.timer_plot_data_out(w1))
+                    self.ext_data_timer_list[-1].start()
+                    
+                    self.plot_data[count] = w1
+
+                
+                if count == 1:
+                    w2 = plot_data_module.Plot_data(self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["file_path"],
+                                                                 int(self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["time_interval"]),
+                                                                 int(self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["time_offset"]),
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["color"],
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["title"],
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["variable_name"],
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["columns"],
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["substract_first_value"],
+                                                                 self.pj[CONVERTERS] if CONVERTERS in self.pj else {},
+                                                                 self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["converters"],
+                                                                 log_level=logging.getLogger().getEffectiveLevel()
+                                                                 )
+
+                    if w2.error_msg:
+                        QMessageBox.critical(self, programName, "Impossibile to plot data from file {}:\n{}".format(os.path.basename(self.pj[OBSERVATIONS][self.observationId][PLOT_DATA][idx]["file_path"]),
+                                                                                                             w2.error_msg))
+                        del w2
+                        return False
+
+                    w2.setWindowFlags(Qt.WindowStaysOnTopHint)
+                    w2.sendEvent.connect(self.signal_from_widget)
+
+                    w2.show()
+                    self.ext_data_timer_list.append(QTimer())
+                    self.ext_data_timer_list[-1].setInterval(w2.time_out)
+                    self.ext_data_timer_list[-1].timeout.connect(lambda: self.timer_plot_data_out(w2))
+                    self.ext_data_timer_list[-1].start()
+                    
+                    self.plot_data[count] = w2
+
+
+                count += 1
 
         # check if "filtered behaviors"
         if FILTERED_BEHAVIORS in self.pj[OBSERVATIONS][self.observationId]:
@@ -3504,11 +3429,22 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         return True
 
-    def signal_from_spectrogram(self, event):
+
+    def timer_plot_data_out(self, w):
         """
-        receive signal from spectrogram widget
+        update plot in w (Plot_data class)
+        triggered by timers in self.ext_data_timer_list
+        """
+        w.update_plot(self.getLaps())
+
+
+
+    def signal_from_widget(self, event):
+        """
+        receive signal from widget
         """
         self.keyPressEvent(event)
+
 
     def eventFilter(self, source, event):
         """
@@ -3521,6 +3457,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.keyPressEvent(event)
 
         return QMainWindow.eventFilter(self, source, event)
+
 
     def loadEventsInTW(self, obsId):
         """
@@ -3556,112 +3493,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         show observations list window
         mode: accepted values: OPEN, EDIT, SINGLE, MULTIPLE, SELECT1
         """
-        import select_observations
-        
         resultStr, selectedObs = select_observations.select_observations(self.pj, mode)
         
         return resultStr, selectedObs
-        '''
-        obsListFields = ["id", "date", "description", "subjects", "media"]
-        indepVarHeader, column_type = [], [TEXT] * len(obsListFields)
-
-        if INDEPENDENT_VARIABLES in self.pj:
-            for idx in sorted_keys(self.pj[INDEPENDENT_VARIABLES]):
-                indepVarHeader.append(self.pj[INDEPENDENT_VARIABLES][idx]["label"])
-                column_type.append(self.pj[INDEPENDENT_VARIABLES][idx]["type"])
-
-        data = []
-        for obs in sorted(list(self.pj[OBSERVATIONS].keys())):
-            date = self.pj[OBSERVATIONS][obs]["date"].replace("T", " ")
-            descr = self.pj[OBSERVATIONS][obs]["description"]
-
-            # subjects
-            observedSubjects = self.extract_observed_subjects([obs])
-
-            # remove when No focal subject
-            if "" in observedSubjects:
-                observedSubjects.remove("")
-            subjectsList = ", ".join(observedSubjects)
-
-            mediaList = []
-            if self.pj[OBSERVATIONS][obs][TYPE] in [MEDIA]:
-                if self.pj[OBSERVATIONS][obs][FILE]:
-                    for player in sorted(self.pj[OBSERVATIONS][obs][FILE].keys()):
-                        for media in self.pj[OBSERVATIONS][obs][FILE][player]:
-                            mediaList.append("#{0}: {1}".format(player, media))
-
-                media = os.linesep.join(mediaList)
-            elif self.pj[OBSERVATIONS][obs][TYPE] in [LIVE]:
-                media = LIVE
-
-            # independent variables
-            indepvar = []
-            if INDEPENDENT_VARIABLES in self.pj[OBSERVATIONS][obs]:
-                for var_label in indepVarHeader:
-                    if var_label in self.pj[OBSERVATIONS][obs][INDEPENDENT_VARIABLES]:
-                        indepvar.append(self.pj[OBSERVATIONS][obs][INDEPENDENT_VARIABLES][var_label])
-                    else:
-                        indepvar.append("")
-
-            data.append([obs, date, descr, subjectsList, media] + indepvar)
-
-        obsList = observations_list.observationsList_widget(data, header=obsListFields + indepVarHeader, column_type=column_type)
-
-        obsList.pbOpen.setVisible(False)
-        obsList.pbEdit.setVisible(False)
-        obsList.pbOk.setVisible(False)
-        obsList.pbSelectAll.setVisible(False)
-        obsList.pbUnSelectAll.setVisible(False)
-        obsList.mode = mode
-
-        if mode == OPEN:
-            obsList.view.setSelectionMode(QAbstractItemView.SingleSelection)
-            obsList.pbOpen.setVisible(True)
-
-        if mode == EDIT:
-            obsList.view.setSelectionMode(QAbstractItemView.SingleSelection)
-            obsList.pbEdit.setVisible(True)
-
-        if mode == SINGLE:
-            obsList.view.setSelectionMode(QAbstractItemView.SingleSelection)
-            obsList.pbOpen.setVisible(True)
-            obsList.pbEdit.setVisible(True)
-
-        if mode == MULTIPLE:
-            obsList.view.setSelectionMode(QAbstractItemView.MultiSelection)
-            obsList.pbOk.setVisible(True)
-            obsList.pbSelectAll.setVisible(True)
-            obsList.pbUnSelectAll.setVisible(True)
-
-        if mode == SELECT1:
-            obsList.view.setSelectionMode(QAbstractItemView.SingleSelection)
-            obsList.pbOk.setVisible(True)
-
-        obsList.resize(900, 600)
-
-        obsList.view.sortItems(0, Qt.AscendingOrder)
-
-        selectedObs = []
-
-        result = obsList.exec_()
-
-        if result:
-            if obsList.view.selectedIndexes():
-                for idx in obsList.view.selectedIndexes():
-                    if idx.column() == 0:   # first column
-                        selectedObs.append(idx.data())
-
-        if result == 0:  # cancel
-            resultStr = ""
-        if result == 1:   # select
-            resultStr = "ok"
-        if result == 2:   # open
-            resultStr = OPEN
-        if result == 3:   # edit
-            resultStr = EDIT
-
-        return resultStr, selectedObs
-    '''
 
 
     def initialize_new_live_observation(self):
@@ -3699,8 +3533,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.liveStartTime = None
         self.liveTimer.stop()
 
+
     def new_observation_triggered(self):
         self.new_observation(mode=NEW, obsId="")
+
 
     def new_observation(self, mode=NEW, obsId=""):
         """
@@ -3714,7 +3550,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             else:
                 self.close_observation()
 
-        observationWindow = observation.Observation(logging.getLogger().getEffectiveLevel())
+
+        observationWindow = observation.Observation(self.ffmpeg_cache_dir if self.ffmpeg_cache_dir else tempfile.gettempdir(),
+                                                    converters=self.pj[CONVERTERS] if CONVERTERS in self.pj else {},
+                                                    log_level=logging.getLogger().getEffectiveLevel())
 
         observationWindow.pj = self.pj
         observationWindow.mode = mode
@@ -3826,7 +3665,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                         observationWindow.rbLater.setChecked(True)
 
             if self.timeFormat == HHMMSS:
-
                 time = QTime()
                 h, m, s_dec = seconds2time(abs(self.pj[OBSERVATIONS][obsId]["time offset"])).split(":")
                 s, ms = s_dec.split(".")
@@ -3845,10 +3683,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     else:
                         observationWindow.rbLater.setChecked(True)
 
-
             if self.pj[OBSERVATIONS][obsId]["time offset"] < 0:
                 observationWindow.rbSubstract.setChecked(True)
-
+                
             for player, twVideo in zip([PLAYER1, PLAYER2], [observationWindow.twVideo1, observationWindow.twVideo2]):
 
                 if player in self.pj[OBSERVATIONS][obsId][FILE] and self.pj[OBSERVATIONS][obsId][FILE][player]:
@@ -3885,6 +3722,44 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             observationWindow.cbVisualizeSpectrogram.setEnabled(True)
             if "visualize_spectrogram" in self.pj[OBSERVATIONS][obsId]:
                 observationWindow.cbVisualizeSpectrogram.setChecked(self.pj[OBSERVATIONS][obsId]["visualize_spectrogram"])
+
+            # plot data
+            if PLOT_DATA in self.pj[OBSERVATIONS][obsId]:
+                if self.pj[OBSERVATIONS][obsId][PLOT_DATA]:
+
+                    observationWindow.tw_data_files.setRowCount(0)
+                    for idx2 in sorted_keys(self.pj[OBSERVATIONS][obsId][PLOT_DATA]):
+                        observationWindow.tw_data_files.setRowCount(observationWindow.tw_data_files.rowCount() + 1)
+                        for idx3 in DATA_PLOT_FIELDS:
+                            if idx3 == PLOT_DATA_PLOTCOLOR_IDX:
+                                combobox = QComboBox()
+                                combobox.addItems(DATA_PLOT_STYLES)
+                                combobox.setCurrentIndex(DATA_PLOT_STYLES.index(self.pj[OBSERVATIONS][obsId][PLOT_DATA][idx2][DATA_PLOT_FIELDS[idx3]]))
+
+                                observationWindow.tw_data_files.setCellWidget(observationWindow.tw_data_files.rowCount() - 1,
+                                                                              PLOT_DATA_PLOTCOLOR_IDX, combobox)
+                            elif idx3 == PLOT_DATA_SUBSTRACT1STVALUE_IDX:
+                                combobox2 = QComboBox()
+                                combobox2.addItems(["False","True"])
+                                combobox2.setCurrentIndex(["False", "True"].index(self.pj[OBSERVATIONS][obsId][PLOT_DATA][idx2][DATA_PLOT_FIELDS[idx3]]))
+
+                                observationWindow.tw_data_files.setCellWidget(observationWindow.tw_data_files.rowCount() - 1,
+                                                                              PLOT_DATA_SUBSTRACT1STVALUE_IDX, combobox2)
+                            elif idx3 == PLOT_DATA_CONVERTERS_IDX:
+                                # convert dict to str
+                                '''
+                                s = ""
+                                for conv in self.pj[OBSERVATIONS][obsId][PLOT_DATA][idx2][DATA_PLOT_FIELDS[idx3]]:
+                                    s += "," if s else ""
+                                    s += "{}:{}".format(conv, self.pj[OBSERVATIONS][obsId][PLOT_DATA][idx2][DATA_PLOT_FIELDS[idx3]][conv])
+                                '''
+                                observationWindow.tw_data_files.setItem(observationWindow.tw_data_files.rowCount() - 1, idx3, 
+                                                                        QTableWidgetItem(str(self.pj[OBSERVATIONS][obsId][PLOT_DATA][idx2][DATA_PLOT_FIELDS[idx3]])))
+
+                            else:
+                                observationWindow.tw_data_files.setItem(observationWindow.tw_data_files.rowCount() - 1, idx3,
+                                    QTableWidgetItem(self.pj[OBSERVATIONS][obsId][PLOT_DATA][idx2][DATA_PLOT_FIELDS[idx3]]))
+
 
             # cbCloseCurrentBehaviorsBetweenVideo
             observationWindow.cbCloseCurrentBehaviorsBetweenVideo.setEnabled(True)
@@ -3954,6 +3829,25 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             # visualize spectrogram
             self.pj[OBSERVATIONS][new_obs_id]["visualize_spectrogram"] = observationWindow.cbVisualizeSpectrogram.isChecked()
+            
+            # plot data
+            if observationWindow.tw_data_files.rowCount():
+                self.pj[OBSERVATIONS][new_obs_id][PLOT_DATA] = {}
+                for row in range(observationWindow.tw_data_files.rowCount()):
+                    self.pj[OBSERVATIONS][new_obs_id][PLOT_DATA][str(row)] = {}
+                    for idx2 in DATA_PLOT_FIELDS:
+                        if idx2 in [PLOT_DATA_PLOTCOLOR_IDX, PLOT_DATA_SUBSTRACT1STVALUE_IDX]:
+                            self.pj[OBSERVATIONS][new_obs_id][PLOT_DATA][str(row)][DATA_PLOT_FIELDS[idx2]] = observationWindow.tw_data_files.cellWidget(row, idx2).currentText()
+
+                        elif idx2 == PLOT_DATA_CONVERTERS_IDX:
+                            if observationWindow.tw_data_files.item(row, idx2).text():
+                                self.pj[OBSERVATIONS][new_obs_id][PLOT_DATA][str(row)][DATA_PLOT_FIELDS[idx2]] = eval(observationWindow.tw_data_files.item(row, idx2).text())
+                            else:
+                                self.pj[OBSERVATIONS][new_obs_id][PLOT_DATA][str(row)][DATA_PLOT_FIELDS[idx2]] = {}
+
+                        else:
+                            self.pj[OBSERVATIONS][new_obs_id][PLOT_DATA][str(row)][DATA_PLOT_FIELDS[idx2]] = observationWindow.tw_data_files.item(row, idx2).text()
+
 
             # cbCloseCurrentBehaviorsBetweenVideo
             self.pj[OBSERVATIONS][new_obs_id][CLOSE_BEHAVIORS_BETWEEN_VIDEOS] = observationWindow.cbCloseCurrentBehaviorsBetweenVideo.isChecked()
@@ -4047,7 +3941,29 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             except:
                 pass
         '''
+        try:
 
+            for x in self.ext_data_timer_list:
+                x.stop()
+        except:
+            pass
+
+        try:
+            for pd in self.plot_data:
+                #pd.plot_data_timer.stop()
+                self.plot_data[pd].close_plot()
+                #pd.hide()
+
+        except:
+            pass
+            
+        '''
+        while self.plot_data:
+            self.plot_data[0].close_plot()
+            time.sleep(1)
+            del self.plot_data[0]
+        '''
+        
         if hasattr(self, "measurement_w"):
             try:
                 self.measurement_w.close()
@@ -4119,6 +4035,21 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         logging.info("Close observation {}".format(self.playerType))
 
+        logging.debug("del self.plot_data")
+        
+        if PLOT_DATA in self.pj[OBSERVATIONS][self.observationId] and self.pj[OBSERVATIONS][self.observationId][PLOT_DATA]:
+
+            for x in self.ext_data_timer_list:
+                x.stop()
+
+            for pd in self.plot_data:
+                #pd.plot_data_timer.stop()
+                self.plot_data[pd].close_plot()
+                #pd.hide()
+
+            del self.plot_data
+
+
         self.observationId = ""
 
         self.close_tool_windows()
@@ -4180,12 +4111,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.ffmpegLayout.deleteLater()
                 self.lbFFmpeg.deleteLater()
                 self.ffmpegTab.deleteLater()
-
                 self.FFmpegTimer.stop()
                 self.FFmpegGlobalFrame = 0
                 self.imagesList = set()
             except:
                 pass
+
 
         self.statusbar.showMessage("", 0)
 
@@ -4193,12 +4124,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.toolBar.setEnabled(False)
         self.dwObservations.setVisible(False)
         self.toolBox.setVisible(False)
+        self.lb_current_media_time.setVisible(False)
         self.lbFocalSubject.setVisible(False)
         self.lbCurrentStates.setVisible(False)
 
         self.twEvents.setRowCount(0)
 
         self.lbTime.clear()
+        self.lb_current_media_time.clear()
         self.lbSubject.clear()
         self.lbFocalSubject.setText(NO_FOCAL_SUBJECT)
 
@@ -4210,6 +4143,17 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.menu_options()
 
 
+    def set_recent_projects_menu(self):
+        """
+        set the recent projects submenu
+        """
+        self.menuRecent_projects.clear()
+        for project_file_path in self.recent_projects:
+            action = QAction(self, visible=False, triggered=self.open_project_activated)
+            action.setText(project_file_path)
+            action.setVisible(True)
+            self.menuRecent_projects.addAction(action)
+
 
     def readConfigFile(self):
         """
@@ -4218,10 +4162,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         logging.debug("read config file")
 
-        if __version__ == 'DEV':
-            iniFilePath = os.path.expanduser('~') + os.sep + '.boris_dev'
-        else:
-            iniFilePath = os.path.expanduser("~") + os.sep + ".boris"
+        iniFilePath = str(pathlib.Path(os.path.expanduser("~")) / ".boris")
 
         if os.path.isfile(iniFilePath):
             settings = QSettings(iniFilePath, QSettings.IniFormat)
@@ -4326,10 +4267,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             except:
                 self.checkForNewVersion = False
 
+            # pause before add event
+            self.pause_before_addevent = False
+            try:
+                self.pause_before_addevent = (settings.value("pause_before_addevent") == 'true')
+            except:
+                self.pause_before_addevent = False
 
             if self.checkForNewVersion:
                 if (settings.value("last_check_for_new_version") and
-                 int(time.mktime(time.localtime())) - int(settings.value('last_check_for_new_version')) > CHECK_NEW_VERSION_DELAY):
+                 int(time.mktime(time.localtime())) - int(settings.value("last_check_for_new_version")) > CHECK_NEW_VERSION_DELAY):
                     self.actionCheckUpdate_activated(flagMsgOnlyIfNew = True)
 
             self.ffmpeg_cache_dir = ""
@@ -4390,7 +4337,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.plot_colors = settings.value("plot_colors").split("|")
             except:
                 self.plot_colors = BEHAVIORS_PLOT_COLORS
-                
+
+            if ("white" in self.plot_colors 
+                or "azure" in self.plot_colors
+                or "snow" in self.plot_colors):
+                if dialog.MessageDialog(programName, ("The colors list contain colors that are very light.\n"
+                                                   "Do you want to reload the default colors list?"),
+                                                    [NO, YES]) == YES:
+                    self.plot_colors = BEHAVIORS_PLOT_COLORS
 
 
         else: # no .boris file found
@@ -4401,6 +4355,20 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                                                           " Preferences (File > Preferences)"),
                                                             [NO, YES]) == YES)
 
+        # recent projects
+        logging.info("read recent projects")
+        iniFilePath = str(pathlib.Path(os.path.expanduser("~")) / ".boris_recent_projects")
+        if os.path.isfile(iniFilePath):
+            settings = QSettings(iniFilePath, QSettings.IniFormat)
+            self.recent_projects = settings.value("recent_projects").split("|||")
+            while "" in self.recent_projects:
+                self.recent_projects.remove("")
+            self.set_recent_projects_menu()
+        else:
+            self.recent_projects = []
+
+
+
     def saveConfigFile(self, lastCheckForNewVersion=0):
         """
         save config file
@@ -4408,7 +4376,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         logging.info("save config file")
 
-        iniFilePath = os.path.expanduser("~") + os.sep + ".boris"
+        iniFilePath = str(pathlib.Path(os.path.expanduser("~")) / ".boris")
 
         settings = QSettings(iniFilePath, QSettings.IniFormat)
         settings.setValue("MainWindow/Size", self.size())
@@ -4427,6 +4395,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         settings.setValue("alert_nosubject", self.alertNoFocalSubject)
         settings.setValue("tracking_cursor_above_event", self.trackingCursorAboveEvent)
         settings.setValue("check_for_new_version", self.checkForNewVersion)
+        settings.setValue("pause_before_addevent", self.pause_before_addevent)
+        
         if lastCheckForNewVersion:
             settings.setValue("last_check_for_new_version", lastCheckForNewVersion)
 
@@ -4444,6 +4414,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # plot colors
         settings.setValue("plot_colors", "|".join(self.plot_colors))
 
+        # recent projects
+        logging.info("save recent projects")
+        iniFilePath = str(pathlib.Path(os.path.expanduser("~")) / ".boris_recent_projects")
+        settings = QSettings(iniFilePath, QSettings.IniFormat)
+        settings.setValue("recent_projects", "|||".join(self.recent_projects))
 
 
     def edit_project_activated(self):
@@ -4476,51 +4451,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             if self.pj[ETHOGRAM][idx]['code'] == code:
                 return self.pj[ETHOGRAM][idx][TYPE]
         return None
-
-
-    def loadEventsInDB(self, selectedSubjects, selectedObservations, selectedBehaviors):
-        """
-        populate the db databse with events from selectedObservations, selectedSubjects and selectedBehaviors
-        selectedObservations: list
-        selectedSubjects: list
-        selectedBehaviors: list
-        """
-        db = sqlite3.connect(":memory:")
-        db.row_factory = sqlite3.Row
-        cursor = db.cursor()
-        cursor.execute("""CREATE TABLE events (observation TEXT,
-                                               subject TEXT,
-                                               code TEXT,
-                                               type TEXT,
-                                               modifiers TEXT,
-                                               occurence FLOAT,
-                                               comment TEXT)""")
-
-        for subject_to_analyze in selectedSubjects:
-
-            for obsId in selectedObservations:
-
-                for event in self.pj[OBSERVATIONS][obsId][EVENTS]:
-
-                    if event[EVENT_BEHAVIOR_FIELD_IDX] in selectedBehaviors:
-
-                        # extract time, code, modifier and comment (time:0, subject:1, code:2, modifier:3, comment:4)
-                        if ((subject_to_analyze == NO_FOCAL_SUBJECT and event[EVENT_SUBJECT_FIELD_IDX] == "") or
-                                (event[EVENT_SUBJECT_FIELD_IDX] == subject_to_analyze)):
-
-                            r = cursor.execute("""INSERT INTO events
-                                                   (observation, subject, code, type, modifiers, occurence, comment)
-                                                    VALUES (?,?,?,?,?,?,?)""",
-                            (obsId,
-                             NO_FOCAL_SUBJECT if event[EVENT_SUBJECT_FIELD_IDX] == "" else event[EVENT_SUBJECT_FIELD_IDX],
-                             event[EVENT_BEHAVIOR_FIELD_IDX],
-                             STATE if STATE in self.eventType(event[EVENT_BEHAVIOR_FIELD_IDX]).upper() else POINT,
-                             event[EVENT_MODIFIER_FIELD_IDX], 
-                             str(event[EVENT_TIME_FIELD_IDX]),
-                             event[EVENT_COMMENT_FIELD_IDX]))
-
-        db.commit()
-        return cursor
 
 
     def extract_observed_behaviors(self, selected_observations, selectedSubjects):
@@ -4561,9 +4491,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         - inclusion/exclusion of modifiers
         - inclusion/exclusion of behaviors without events (flagShowExcludeBehaviorsWoEvents == True)
 
-        returns dict:
-
-        {"selected subjects": selectedSubjects,
+        Returns:
+            dict: {"selected subjects": selectedSubjects,
                 "selected behaviors": selectedBehaviors,
                 "include modifiers": True/False,
                 "exclude behaviors": True/False,
@@ -4576,7 +4505,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """
 
         paramPanelWindow = param_panel.Param_panel()
-        paramPanelWindow.setMaximumHeight(800)
+        paramPanelWindow.resize(600, 500)
         paramPanelWindow.setWindowTitle("Select subjects and behaviors")
         paramPanelWindow.selectedObservations = selectedObservations
         paramPanelWindow.pj = self.pj
@@ -4604,43 +4533,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             paramPanelWindow.teStartTime.setVisible(False)
             paramPanelWindow.teEndTime.setVisible(False)
 
-
         # hide max time
         if not maxTime:
             paramPanelWindow.frm_time.setVisible(False)
-        """
-        if maxTime:
-            if self.timeFormat == HHMMSS:
-                paramPanelWindow.teStartTime.setTime(QtCore.QTime.fromString("00:00:00.000", "hh:mm:ss.zzz"))
-                paramPanelWindow.teEndTime.setTime(QtCore.QTime.fromString(seconds2time(maxTime), "hh:mm:ss.zzz"))
-                paramPanelWindow.dsbStartTime.setVisible(False)
-                paramPanelWindow.dsbEndTime.setVisible(False)
 
-            if self.timeFormat == S:
-                paramPanelWindow.dsbStartTime.setValue(0.0)
-                paramPanelWindow.dsbEndTime.setValue(maxTime)
-                paramPanelWindow.teStartTime.setVisible(False)
-                paramPanelWindow.teEndTime.setVisible(False)
-
-        else:
-            '''
-            paramPanelWindow.lbStartTime.setVisible(False)
-            paramPanelWindow.lbEndTime.setVisible(False)
-
-            paramPanelWindow.teStartTime.setVisible(False)
-            paramPanelWindow.teEndTime.setVisible(False)
-
-            paramPanelWindow.dsbStartTime.setVisible(False)
-            paramPanelWindow.dsbEndTime.setVisible(False)
-            '''
-            paramPanelWindow.frm_time_interval.setEnabled(False)
-        """
-
-        # extract subjects present in observations
-        '''observedSubjects = self.extract_observed_subjects(selectedObservations)'''
-        
         observedSubjects = project_functions.extract_observed_subjects(self.pj, selectedObservations)
-        
         selectedSubjects = []
 
         # add 'No focal subject'
@@ -4696,7 +4593,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 font = QFont()
                 font.setBold(True)
-                #paramPanelWindow.item.setFont(QFont('', 8, QFont.Bold))
                 paramPanelWindow.item.setFont(font)
                 paramPanelWindow.item.setData(33, "category")
                 paramPanelWindow.item.setData(35, False)
@@ -4767,7 +4663,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         mode must be in ("by_behavior", "by_category", "synthetic")
         """
 
-        '''
         def time_budget_analysis(cursor, plot_parameters, by_category=False):
             """
             extract number of occurrences, total duration, mean ...
@@ -4776,316 +4671,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             categories, out = {}, []
             for subject in plot_parameters["selected subjects"]:
-                out_cat = []
-
-                categories[subject] = {}
-
-                for behavior in plot_parameters["selected behaviors"]:
-
-                    if plot_parameters["include modifiers"]:
-
-                        cursor.execute("SELECT distinct modifiers FROM events WHERE subject = ? AND code = ?", (subject, behavior))
-                        distinct_modifiers = list(cursor.fetchall())
-
-                        if not distinct_modifiers:
-                            if not plot_parameters["exclude behaviors"]:
-
-                                if {self.pj[ETHOGRAM][idx]["type"] for idx in self.pj[ETHOGRAM] if self.pj[ETHOGRAM][idx]["code"] == behavior} == {"State event"}:
-                                    out.append({"subject": subject,
-                                            "behavior": behavior,
-                                            "modifiers": "-",
-                                            "duration": 0,
-                                            "duration_mean": 0,
-                                            "duration_stdev": "NA",
-                                            "number": "0",
-                                            "inter_duration_mean": "NA",
-                                            "inter_duration_stdev": "NA"})
-                                else: # point 
-                                    out.append({"subject": subject,
-                                            "behavior": behavior,
-                                            "modifiers": "-",
-                                            "duration": "NA",
-                                            "duration_mean": "NA",
-                                            "duration_stdev": "NA",
-                                            "number": "0",
-                                            "inter_duration_mean": "NA",
-                                            "inter_duration_stdev": "NA"})
-                            continue
-
-                        if POINT in self.eventType(behavior).upper():
-                            for modifier in distinct_modifiers:
-
-                                if not plot_parameters["start time"] and not plot_parameters["end time"]:
-                                    cursor.execute("""SELECT occurence, observation FROM events
-                                                        WHERE subject = ? 
-                                                            AND code = ? 
-                                                            AND modifiers = ? 
-                                                            ORDER BY observation, occurence""",
-                                                   (subject, behavior, modifier[0]))
-
-                                else:
-                                    cursor.execute("""SELECT occurence,observation FROM events 
-                                                        WHERE subject = ? 
-                                                            AND code = ?
-                                                            AND modifiers = ?
-                                                            AND occurence BETWEEN ? and ? 
-                                                            ORDER BY observation, occurence""",
-                                                   (subject, behavior, modifier[0], str(plot_parameters["start time"]), str(plot_parameters["end time"])))
-
-                                rows = cursor.fetchall()
-
-                                # inter events duration
-                                all_event_interdurations = []
-                                for idx, row in enumerate(rows):
-                                    if idx and row[1] == rows[idx - 1][1]:
-                                        all_event_interdurations.append(float(row[0]) - float(rows[idx - 1][0]))
-
-                                out_cat.append({"subject": subject,
-                                            "behavior": behavior,
-                                            "modifiers": modifier[0],
-                                            "duration": "NA",
-                                            "duration_mean": "NA",
-                                            "duration_stdev": "NA",
-                                            "number": len(rows),
-                                            "inter_duration_mean": round(statistics.mean(all_event_interdurations), 3) if len(all_event_interdurations) else "NA",
-                                            "inter_duration_stdev": round(statistics.stdev(all_event_interdurations), 3) if len(all_event_interdurations) > 1 else "NA"
-                                            })
-
-
-                        if STATE in self.eventType(behavior).upper():
-                            for modifier in distinct_modifiers:
-
-                                if not plot_parameters["start time"] and not plot_parameters["end time"]:
-                                    cursor.execute("""SELECT occurence, observation FROM events
-                                                        WHERE subject = ? 
-                                                            AND code = ? 
-                                                            AND modifiers = ? 
-                                                            ORDER BY observation, occurence""",
-                                                   (subject, behavior, modifier[0]))
-
-                                else:
-                                    cursor.execute("""SELECT occurence,observation FROM events 
-                                                        WHERE subject = ? 
-                                                            AND code = ?
-                                                            AND modifiers = ?
-                                                            AND occurence BETWEEN ? and ? 
-                                                            ORDER BY observation, occurence""",
-                                                   (subject, behavior, modifier[0], str(plot_parameters["start time"]), str(plot_parameters["end time"])))
-
-                                rows = list(cursor.fetchall())
-                                if len(rows) % 2:
-                                    out.append({"subject": subject, "behavior": behavior,
-                                                "modifiers": modifier[0], "duration": UNPAIRED,
-                                                "duration_mean": UNPAIRED, "duration_stdev": UNPAIRED,
-                                                "number": UNPAIRED, "inter_duration_mean": UNPAIRED,
-                                                "inter_duration_stdev": UNPAIRED})
-                                else:
-                                    all_event_durations, all_event_interdurations = [], []
-                                    for idx, row in enumerate(rows):
-                                        # event
-                                        if idx % 2 == 0:
-                                            new_init, new_end = float(row[0]), float(rows[idx + 1][0])
-                                            if len(selectedObservations) == 1:
-                                                if (new_init < plot_parameters["start time"] and new_end < plot_parameters["start time"]) \
-                                                   or \
-                                                   (new_init > plot_parameters["end time"] and new_end > plot_parameters["end time"]):
-                                                    continue
-
-                                                if new_init < plot_parameters["start time"]:
-                                                    new_init = float(plot_parameters["start time"])
-                                                if new_end > plot_parameters["end time"]:
-                                                    new_end = float(plot_parameters["end time"])
-
-                                            all_event_durations.append(new_end - new_init)
-
-                                        # inter event if same observation
-                                        if idx % 2 and idx != len(rows) - 1 and row[1] == rows[idx + 1][1]:
-                                            if plot_parameters["start time"] <= row[0] <= plot_parameters["end time"] and plot_parameters["start time"] <= rows[idx + 1][0] <= plot_parameters["end time"]:
-                                                all_event_interdurations.append(float(rows[idx + 1][0]) - float(row[0]))
-
-                                            #all_event_interdurations.append(float(rows[idx + 1][0]) - float(row[0]))
-
-                                    out_cat.append({"subject": subject,
-                                                "behavior": behavior,
-                                                "modifiers": modifier[0],
-                                                "duration": round(sum(all_event_durations), 3),
-                                                "duration_mean": round(statistics.mean(all_event_durations), 3) if len(all_event_durations) else "NA",
-                                                "duration_stdev": round(statistics.stdev(all_event_durations), 3) if len(all_event_durations) > 1 else "NA",
-                                                "number": len(all_event_durations),
-                                                "inter_duration_mean": round(statistics.mean(all_event_interdurations), 3) if len(all_event_interdurations) else "NA",
-                                                "inter_duration_stdev": round(statistics.stdev(all_event_interdurations), 3) if len(all_event_interdurations) > 1 else "NA"
-                                                })
-
-                    else:  # no modifiers
-
-                        if POINT in self.eventType(behavior).upper():
-
-                            #if len(selectedObservations) > 1:
-                            if not plot_parameters["start time"] and not plot_parameters["end time"]:
-                                cursor.execute("SELECT occurence,observation FROM events WHERE subject = ? AND code = ? ORDER BY observation, occurence", (subject, behavior))
-                            else:
-                                cursor.execute("SELECT occurence,observation FROM events WHERE subject = ? AND code = ? AND occurence BETWEEN ? and ? ORDER BY observation, occurence",
-                                               (subject, behavior, str(plot_parameters["start time"]), str(plot_parameters["end time"])))
-
-                            rows = list(cursor.fetchall())
-
-                            if len(selectedObservations) == 1:
-                                new_rows = []
-                                for occurence, observation in rows:
-                                    new_occurence = max(float(plot_parameters["start time"]), occurence)
-                                    new_occurence = min(new_occurence, float(plot_parameters["end time"]))
-                                    new_rows.append([new_occurence, observation])
-                                rows = list(new_rows)
-
-                            if not len(rows):
-                                if not plot_parameters["exclude behaviors"]:
-
-                                    if {self.pj[ETHOGRAM][idx]["type"] for idx in self.pj[ETHOGRAM] if self.pj[ETHOGRAM][idx]["code"] == behavior} == {"State event"}:
-                                        out.append({"subject": subject,
-                                                "behavior": behavior,
-                                                "modifiers": "",
-                                                "duration": 0,
-                                                "duration_mean": 0,
-                                                "duration_stdev": "NA",
-                                                "number": "0",
-                                                "inter_duration_mean": "NA",
-                                                "inter_duration_stdev": "NA"})
-                                    else: # point 
-                                        out.append({"subject": subject,
-                                                "behavior": behavior,
-                                                "modifiers": "",
-                                                "duration": "NA",
-                                                "duration_mean": "NA",
-                                                "duration_stdev": "NA",
-                                                "number": "0",
-                                                "inter_duration_mean": "NA",
-                                                "inter_duration_stdev": "NA"})
-                                continue
-
-                            # inter events duration
-                            all_event_interdurations = []
-                            for idx, row in enumerate(rows):
-                                if idx and row[1] == rows[idx - 1][1]:
-                                    all_event_interdurations.append(float(row[0]) - float(rows[idx - 1][0]))
-
-                            out_cat.append({"subject": subject,
-                                            "behavior": behavior,
-                                            "modifiers": "-",
-                                            "duration": "NA",
-                                            "duration_mean": "NA",
-                                            "duration_stdev": "NA",
-                                            "number": len(rows),
-                                            "inter_duration_mean": round(statistics.mean(all_event_interdurations), 3) if len(all_event_interdurations) else "NA",
-                                            "inter_duration_stdev": round(statistics.stdev(all_event_interdurations), 3) if len(all_event_interdurations) > 1 else "NA"
-                                            })
-
-                        if STATE in self.eventType(behavior).upper():
-
-                            if not plot_parameters["start time"] and not plot_parameters["end time"]:
-                                print("1...")
-                                cursor.execute("SELECT occurence, observation FROM events WHERE subject = ? AND code = ? ORDER BY observation, occurence", (subject, behavior))
-                            else:
-                                cursor.execute("SELECT occurence, observation FROM events WHERE subject = ? AND code = ? AND occurence BETWEEN ? and ? ORDER BY observation, occurence",
-                                               (subject, behavior, str(plot_parameters["start time"]), str(plot_parameters["end time"])))
-
-                            rows = list(cursor.fetchall())
-                            print(len(rows))
-
-                            if not len(rows):
-                                if not plot_parameters["exclude behaviors"]: # include behaviors without events
-                                    out.append({"subject": subject, "behavior": behavior,
-                                                "modifiers": "-", "duration": 0, "duration_mean": 0,
-                                                "duration_stdev": "NA", "number": 0, "inter_duration_mean": "-",
-                                                "inter_duration_stdev": "-"})
-                                continue
-
-                            if len(rows) % 2:
-                                out.append({"subject": subject, "behavior": behavior, "modifiers": "NA",
-                                            "duration": UNPAIRED, "duration_mean": UNPAIRED, "duration_stdev": UNPAIRED,
-                                            "number": UNPAIRED, "inter_duration_mean": UNPAIRED,
-                                            "inter_duration_stdev": UNPAIRED})
-                            else:
-                                all_event_durations, all_event_interdurations = [], []
-                                for idx, row in enumerate(rows):
-                                    # event
-                                    if idx % 2 == 0:
-                                        new_init, new_end = float(row[0]), float(rows[idx + 1][0])
-                                        
-                                        """
-                                        if len(selectedObservations) == 1:
-                                            if ((new_init < plot_parameters["start time"] and new_end < plot_parameters["start time"])
-                                               or
-                                               (new_init > plot_parameters["end time"] and new_end > plot_parameters["end time"])):
-                                                continue
-
-                                            if new_init < plot_parameters["start time"]:
-                                                new_init = float(plot_parameters["start time"])
-                                            if new_end > plot_parameters["end time"]:
-                                                new_end = float(plot_parameters["end time"])
-                                        """
-
-                                        all_event_durations.append(new_end - new_init)
-
-                                    # inter event if same observation
-                                    if idx % 2 and idx != len(rows) - 1 and row[1] == rows[idx + 1][1]:
-                                        if plot_parameters["start time"] <= row[0] <= plot_parameters["end time"] and plot_parameters["start time"] <= rows[idx + 1][0] <= plot_parameters["end time"]:
-                                            all_event_interdurations.append(float(rows[idx + 1][0]) - float(row[0]))
-
-                                out_cat.append({"subject": subject,
-                                            "behavior": behavior,
-                                            "modifiers": "-",
-                                            "duration": round(sum(all_event_durations), 3),
-                                            "duration_mean": round(statistics.mean(all_event_durations), 3) if len(all_event_durations) else "NA",
-                                            "duration_stdev": round(statistics.stdev(all_event_durations), 3) if len(all_event_durations) > 1 else "NA",
-                                            "number": len(all_event_durations),
-                                            "inter_duration_mean": round(statistics.mean(all_event_interdurations), 3) if len(all_event_interdurations) else "NA",
-                                            "inter_duration_stdev": round(statistics.stdev(all_event_interdurations), 3) if len(all_event_interdurations) > 1 else "NA"
-                                            })
-
-                out += out_cat
-
-                if by_category: # and flagCategories:
-
-                    for behav in out_cat:
-
-                        try:
-                            category = [self.pj[ETHOGRAM][x]["category"] for x in self.pj[ETHOGRAM] if "category" in self.pj[ETHOGRAM][x] and self.pj[ETHOGRAM][x]["code"] == behav['behavior']][0]
-                        except:
-                            category = ""
-
-                        if category in categories[subject]:
-                            if behav["duration"] != "-" and categories[subject][category]["duration"] != "-":
-                                categories[subject][category]["duration"] += behav["duration"]
-                            else:
-                                categories[subject][category]["duration"] = "-"
-                            categories[subject][category]["number"] += behav["number"]
-                        else:
-                            categories[subject][category] = {"duration": behav["duration"], "number": behav["number"]}
-
-            out_sorted = []
-            for subject in plot_parameters["selected subjects"]:
-                for behavior in plot_parameters["selected behaviors"]:
-                    for row in out:
-                        if row["subject"] == subject and row["behavior"] == behavior:
-                            out_sorted.append(row)
-
-
-            ### http://stackoverflow.com/questions/673867/python-arbitrary-order-by
-            return out_sorted, categories
-        '''
-
-
-        def time_budget_analysis_2(cursor, plot_parameters, by_category=False):
-            """
-            extract number of occurrences, total duration, mean ...
-            if start_time = 0 and end_time = 0 all events are extracted
-            """
-
-            categories, out = {}, []
-            for subject in plot_parameters["selected subjects"]:
-                out_cat = []
-
-                categories[subject] = {}
+                out_cat, categories[subject] = [], {}
 
                 for behavior in plot_parameters["selected behaviors"]:
 
@@ -5407,6 +4993,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
 
         def default_value(behav, param):
+            """
+            return value for duration in case of point event
+            """
             default_value_ = 0
             if ({self.pj[ETHOGRAM][idx]["type"] for idx in self.pj[ETHOGRAM] if self.pj[ETHOGRAM][idx]["code"] == behav} == {"Point event"} 
                and param in ["duration"]):
@@ -5415,6 +5004,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
 
         def init_behav_modif():
+            """
+            initialize dictionary with subject, behaviors and modifiers
+            """
             behaviors = {}
             for subj in plot_parameters["selected subjects"]:
                 behaviors[subj] = {}
@@ -5424,23 +5016,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                         behaviors[subj][behav] = {}
                     if not plot_parameters["include modifiers"]:
                         for param in parameters:
-                            '''
-                            default_value = 0
-                            if ({self.pj[ETHOGRAM][idx]["type"] for idx in self.pj[ETHOGRAM] if self.pj[ETHOGRAM][idx]["code"] == behav} == {"Point event"} 
-                               and param[0] in ["duration"]):
-                                   default_value = "-"
-                            '''
                             behaviors[subj][behav][param[0]] = default_value(behav, param[0])
 
                     if plot_parameters["include modifiers"]:
                         behaviors[subj][behav][modif] = {}
                         for param in parameters:
-                            '''
-                            default_value = 0
-                            if ({self.pj[ETHOGRAM][idx]["type"] for idx in self.pj[ETHOGRAM] if self.pj[ETHOGRAM][idx]["code"] == behav} == {"Point event"} 
-                               and param[0] in ["duration"]):
-                                   default_value = "-"
-                            '''
                             behaviors[subj][behav][modif][param[0]] = default_value(behav, param[0])
 
             return behaviors
@@ -5448,7 +5028,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         result, selectedObservations = self.selectObservations(MULTIPLE)
 
-        logging.debug("Selected observations: {0}".format(selectedObservations))
+        logging.debug("Selected observations: {}".format(selectedObservations))
 
         if not selectedObservations:
             return
@@ -5460,39 +5040,26 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # check if state events are paired
         out = ""
         for obsId in selectedObservations:
-            r, msg = self.check_state_events_obs(obsId)
+            r, msg = project_functions.check_state_events_obs(obsId, self.pj[ETHOGRAM],
+                                                              self.pj[OBSERVATIONS][obsId], self.timeFormat)
+
             if not r:
-                out += "<strong>{obsId}</strong><br>{msg}<br>".format(obsId=obsId, msg=msg)
+                out += "Observation: <strong>{obsId}</strong><br>{msg}<br>".format(obsId=obsId, msg=msg)
 
         if out:
-            d = QDialog()
-            d.setWindowTitle("Check selected observations")
-            hbox = QVBoxLayout()
+            self.results = dialog.ResultsWidget()
+            
+            self.results.setWindowTitle(programName + " - Check selected observations")
+            self.results.ptText.setReadOnly(True)
+            self.results.ptText.appendHtml(out)
+            self.results.show()
 
-            d.lb = QLabel("The following observations have some problems")
-            hbox.addWidget(d.lb)
-
-            d.ptText = QPlainTextEdit()
-            d.ptText.setReadOnly(True)
-            d.ptText.appendHtml(out)
-            hbox.addWidget(d.ptText)
-
-            hbox2 = QHBoxLayout()
-            d.pbOK = QPushButton("OK")
-            d.pbOK.clicked.connect(d.close)
-
-            hbox2.addWidget(d.pbOK)
-            hbox.addLayout(hbox2)
-
-            d.setLayout(hbox)
-
-            d.setWindowModality(Qt.ApplicationModal)
-            d.exec_()
 
         selectedObsTotalMediaLength = Decimal("0.0")
         max_obs_length = 0
         for obsId in selectedObservations:
-            obs_length = self.observationTotalMediaLength(obsId)
+            obs_length =project_functions.observation_total_length(self.pj[OBSERVATIONS][obsId])
+
             logging.debug("media length for {0}: {1}".format(obsId, obs_length))
 
             if obs_length in [0, -1]:
@@ -5529,7 +5096,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                                                       by_category=(mode == "by_category"))
 
         if mode == "synthetic":
-            QMessageBox.warning(self, programName, "This function is experimental.<br>Please check results carefully and report any bug")            
             plot_parameters = self.choose_obs_subj_behav_category(selectedObservations,
                                                                   maxTime=max_obs_length,
                                                                   flagShowExcludeBehaviorsWoEvents=False,
@@ -5541,12 +5107,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # check if time_budget window must be used
         if mode in ["by_behavior", "by_category"] and (flagGroup or len(selectedObservations) == 1):
 
+            '''
             cursor = self.loadEventsInDB(plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
+            '''
+            cursor = db_functions.load_events_in_db(self.pj, plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
 
             total_observation_time = 0
             for obsId in selectedObservations:
 
-                obs_length = self.observationTotalMediaLength(obsId)
+                '''TO BE REMOVED  obs_length = self.observationTotalMediaLength(obsId)'''
+                
+                obs_length = project_functions.observation_total_length(self.pj[OBSERVATIONS][obsId])
+                
                 if obs_length == -1:
                     obs_length = 0
 
@@ -5567,6 +5139,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 if plot_parameters["time"] == TIME_ARBITRARY_INTERVAL:
                     min_time = float(plot_parameters["start time"])
                     max_time = float(plot_parameters["end time"])
+
                     # check intervals
                     for subj in plot_parameters["selected subjects"]:
                         for behav in plot_parameters["selected behaviors"]:
@@ -5577,15 +5150,25 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                             cursor.execute("SELECT distinct modifiers FROM events WHERE observation = ? AND subject = ? AND code = ?", (obsId, subj, behav))
                             distinct_modifiers = list(cursor.fetchall())
+                            
+                            logging.debug("distinct_modifiers: {}".format(distinct_modifiers))
 
                             for modifier in distinct_modifiers:
-                                print("modifier", modifier[0])
-                                if len(cursor.execute("""SELECT * FROM events WHERE observation = ? AND subject = ? AND code = ? AND modifiers = ? AND occurence <= ?""",
+
+                                #if not modifier[0]:
+                                #    continue
+
+                                logging.debug("modifier #{}#".format(modifier[0]))
+
+                                if len(cursor.execute("""SELECT * FROM events WHERE observation = ? AND subject = ? AND code = ? AND modifiers = ? AND occurence < ?""",
                                                (obsId, subj, behav, modifier[0], min_time)).fetchall()) % 2:
+
                                     cursor.execute("INSERT INTO events (observation, subject, code, type, modifiers, occurence) VALUES (?,?,?,?,?,?)",
                                                    (obsId, subj, behav, "STATE", modifier[0], min_time))
-                                if len(cursor.execute("""SELECT * FROM events WHERE observation = ? AND subject = ? AND code = ? AND modifiers = ? AND occurence >= ?""",
+
+                                if len(cursor.execute("""SELECT * FROM events WHERE observation = ? AND subject = ? AND code = ? AND modifiers = ? AND occurence > ?""",
                                                (obsId, subj, behav, modifier[0], max_time)).fetchall()) % 2:
+
                                     cursor.execute("INSERT INTO events (observation, subject, code, type, modifiers, occurence) VALUES (?,?,?,?,?,?)",
                                                    (obsId, subj, behav, "STATE", modifier[0], max_time))
                             try:
@@ -5596,9 +5179,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 total_observation_time += (max_time - min_time)
 
                 cursor.execute("""DELETE FROM events WHERE observation = ? AND (occurence < ? OR occurence > ?)""", (obsId, min_time, max_time))
-                cursor.execute("commit")
+#                cursor.execute("commit")
 
-            out, categories = time_budget_analysis_2(cursor, plot_parameters, by_category=(mode == "by_category"))
+            out, categories = time_budget_analysis(cursor, plot_parameters, by_category=(mode == "by_category"))
 
             # widget for results visualization
             self.tb = timeBudgetResults(logging.getLogger().getEffectiveLevel(), self.pj)
@@ -5700,21 +5283,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                      "Microsoft Excel Spreadsheet (*.xlsx)",
                      "Microsoft Excel Workbook (*.xlsx)",
                      "HTML (*.html)",
-                     #"Pandas dataframe (*.df)",
                      "Legacy Microsoft Excel Spreadsheet (*.xls)")
 
-                #formats = ["tsv", "csv", "od spreadsheet", "od workbook", "xlsx spreadsheet", "xlsx workbook", "html", "pd dataframe", "xls legacy"]
                 formats = ["tsv", "csv", "od spreadsheet", "od workbook", "xlsx spreadsheet", "xlsx workbook", "html", "xls legacy"]
 
                 item, ok = QInputDialog.getItem(self, "Time budget analysis format", "Available formats", items, 0, False)
                 if not ok:
                     return
-                    
+
                 outputFormat = formats[items.index(item)]
                 extension = re.sub(".* \(\*\.", "", item)[:-1]
 
             flagWorkBook = False
-            
+
             if mode in ["by_behavior", "by_category"] and "workbook" in outputFormat:
                 workbook = tablib.Databook()
                 flagWorkBook = True
@@ -5771,7 +5352,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 
                 parameters = [["duration", "Total duration"], ["number", "Number of occurrences"]]
                 
+                '''
                 cursor = self.loadEventsInDB(plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
+                '''
+
+                cursor = db_functions.load_events_in_db(self.pj, plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
+                
                 cursor.execute("SELECT distinct code, modifiers FROM events WHERE subject in ({})".format(",".join("?" * len(plot_parameters["selected subjects"]))),
                                (plot_parameters["selected subjects"]))
                 
@@ -5802,7 +5388,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                     modif_header.append(modif)
                                     param_header.append(param[1])
     
-                print(len(subj_header))
                 data_report.append(subj_header)
                 data_report.append(behav_header)
                 if plot_parameters["include modifiers"]:
@@ -5819,10 +5404,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
 
             for obsId in selectedObservations:
+
+                cursor = db_functions.load_events_in_db(self.pj, plot_parameters["selected subjects"], [obsId], plot_parameters["selected behaviors"])
+
+                '''TO BE REMOVED  obs_length = self.observationTotalMediaLength(obsId)'''
                 
-                cursor = self.loadEventsInDB(plot_parameters["selected subjects"], [obsId], plot_parameters["selected behaviors"])
+                obs_length = project_functions.observation_total_length(self.pj[OBSERVATIONS][obsId])
                 
-                obs_length = self.observationTotalMediaLength(obsId)
                 if obs_length == -1:
                     obs_length = 0
 
@@ -5856,12 +5444,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                             distinct_modifiers = list(cursor.fetchall())
 
                             for modifier in distinct_modifiers:
-                                print("modifier", modifier[0])
-                                if len(cursor.execute("""SELECT * FROM events WHERE observation = ? AND subject = ? AND code = ? AND modifiers = ? AND occurence <= ?""",
+
+                                if len(cursor.execute("""SELECT * FROM events WHERE observation = ? AND subject = ? AND code = ? AND modifiers = ? AND occurence < ?""",
                                                (obsId, subj, behav, modifier[0], min_time)).fetchall()) % 2:
                                     cursor.execute("INSERT INTO events (observation, subject, code, type, modifiers, occurence) VALUES (?,?,?,?,?,?)",
                                                    (obsId, subj, behav, "STATE", modifier[0], min_time))
-                                if len(cursor.execute("""SELECT * FROM events WHERE observation = ? AND subject = ? AND code = ? AND modifiers = ? AND occurence >= ?""",
+                                if len(cursor.execute("""SELECT * FROM events WHERE observation = ? AND subject = ? AND code = ? AND modifiers = ? AND occurence > ?""",
                                                (obsId, subj, behav, modifier[0], max_time)).fetchall()) % 2:
                                     cursor.execute("INSERT INTO events (observation, subject, code, type, modifiers, occurence) VALUES (?,?,?,?,?,?)",
                                                    (obsId, subj, behav, "STATE", modifier[0], max_time))
@@ -5871,9 +5459,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                 pass
 
                 cursor.execute("""DELETE FROM events WHERE observation = ? AND (occurence < ? OR occurence > ?)""", (obsId, min_time,max_time))
-                cursor.execute("commit")
 
-                out, categories = time_budget_analysis_2(cursor, plot_parameters, by_category=(mode == "by_category"))
+                out, categories = time_budget_analysis(cursor, plot_parameters, by_category=(mode == "by_category"))
 
                 if mode == "synthetic":
 
@@ -5907,7 +5494,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                                     for param in parameters:
                                         columns.append(behaviors[subj][behav][modif][param[0]])
 
-                    print(len(columns))
                     data_report.append(columns)
 
                 if mode in ["by_behavior", "by_category"]:
@@ -5987,16 +5573,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     data.title = obsId
                     for row in rows:
                         data.append(complete(row, max([len(r) for r in rows])))
-    
+
                     if "xls" in outputFormat:
-                        for forbidden_char in r"\/*[]:?":
+                        for forbidden_char in EXCEL_FORBIDDEN_CHARACTERS:
                             data.title = data.title.replace(forbidden_char, " ")
     
                     if flagWorkBook:
-    
-                        for forbidden_char in r"\/*[]:?":
+                        for forbidden_char in EXCEL_FORBIDDEN_CHARACTERS:
                             data.title = data.title.replace(forbidden_char, " ")
-    
                         if "xls" in outputFormat:
                             if len(data.title) > 31:
                                 data.title = data.title[:31]
@@ -6005,27 +5589,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     else:
     
                         fileName = exportDir + os.sep + safeFileName(obsId) + "." + extension
-                        
-                        if outputFormat == "tsv":
+
+                        if outputFormat in ["tsv", "csv", "html"]:
                             with open(fileName, "wb") as f:
-                                f.write(str.encode(data.tsv))
-                        if outputFormat == "csv":
-                            with open(fileName, "wb") as f:
-                                f.write(str.encode(data.csv))
+                                f.write(str.encode(data.export(outputFormat)))
+
                         if outputFormat == "od spreadsheet":
                             with open(fileName, "wb") as f:
                                 f.write(data.ods)
+
                         if outputFormat == "xlsx spreadsheet":
                             with open(fileName, "wb") as f:
                                 f.write(data.xlsx)
-                        '''
-                        if outputFormat == "pd dataframe":
-                            with open(fileName, "wb") as f:
-                                f.write(str.encode(data.df))
-                        '''
-                        if outputFormat == "html":
-                            with open(fileName, "wb") as f:
-                                f.write(str.encode(data.html))
+
                         if outputFormat == "xls legacy":
                             if len(data.title) > 31:
                                 data.title = data.title[:31]
@@ -6036,26 +5612,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                             with open(fileName, "wb") as f:
                                 f.write(data.xls)
 
-
             if mode == "synthetic":
-                if "tsv" == extension:
+                if extension in ["tsv", "csv", "html"]:
                     with open(fileName, "wb") as f:
-                         f.write(str.encode(data_report.tsv))
-                if "csv" == extension:
+                        f.write(str.encode(data_report.export(extension)))
+                if extension in ["ods", "xlsx", "xls"]:
                     with open(fileName, "wb") as f:
-                         f.write(str.encode(data_report.csv))
-                if "ods" == extension:
-                    with open(fileName, "wb") as f:
-                         f.write(data_report.ods)
-                if "xlsx" == extension:
-                    with open(fileName, "wb") as f:
-                         f.write(data_report.xlsx)
-                if "xls" == extension:
-                    with open(fileName, "wb") as f:
-                         f.write(data_report.xls)
-                if "html" == extension:
-                    with open(fileName, "wb") as f:
-                         f.write(str.encode(data_report.html))
+                         f.write(data_report.export(extension))
 
             if mode in ["by_behavior", "by_category"] and flagWorkBook:
                 if "xls" in outputFormat:
@@ -6066,293 +5629,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                         f.write(workbook.ods)
 
 
-
-    def observationTotalMediaLength(self, obsId):
-        """
-        total length for observation
-        
-        media: if media length not available return 0
-                if more media are queued, return sum of media length
-        
-        live: return last event time
-        
-        return total length in s (Decimal type)
-        """
-
-        if self.pj[OBSERVATIONS][obsId][TYPE] == LIVE:
-            if self.pj[OBSERVATIONS][obsId][EVENTS]:
-                totalMediaLength = max(self.pj[OBSERVATIONS][obsId][EVENTS])[EVENT_TIME_FIELD_IDX]
-            else:
-                totalMediaLength = Decimal("0.0")
-            return totalMediaLength
-
-        if self.pj[OBSERVATIONS][obsId][TYPE] == MEDIA:
-            totalMediaLength, totalMediaLength1, totalMediaLength2 = Decimal("0.0"), Decimal("0.0"), Decimal("0.0")
-
-            for mediaFile in self.pj[OBSERVATIONS][obsId][FILE][PLAYER1]:
-                mediaLength = 0
-                try:
-                    mediaLength = self.pj[OBSERVATIONS][obsId]["media_info"]["length"][mediaFile]
-                except:
-                    nframe, videoTime, videoDuration, fps, hasVideo, hasAudio = accurate_media_analysis(self.ffmpeg_bin, mediaFile)
-                    if "media_info" not in self.pj[OBSERVATIONS][obsId]:
-                        self.pj[OBSERVATIONS][obsId]["media_info"] = {"length": {}, "fps": {}}
-                        if "length" not in self.pj[OBSERVATIONS][obsId]["media_info"]:
-                            self.pj[OBSERVATIONS][obsId]["media_info"]["length"] = {}
-                        if "fps" not in self.pj[OBSERVATIONS][obsId]["media_info"]:
-                            self.pj[OBSERVATIONS][obsId]["media_info"]["fps"] = {}
-
-                    self.pj[OBSERVATIONS][obsId]["media_info"]["length"][mediaFile] = videoDuration
-                    self.pj[OBSERVATIONS][obsId]["media_info"]["fps"][mediaFile] = fps
-
-                    mediaLength = videoDuration
-
-                totalMediaLength1 += Decimal(mediaLength)
-
-            for mediaFile in self.pj[OBSERVATIONS][obsId][FILE][PLAYER2]:
-                mediaLength = 0
-                try:
-                    mediaLength = self.pj[OBSERVATIONS][obsId]["media_info"]["length"][mediaFile]
-                except:
-                    nframe, videoTime, videoDuration, fps, hasVideo, hasAudio = accurate_media_analysis(self.ffmpeg_bin, mediaFile)
-                    if "media_info" not in self.pj[OBSERVATIONS][obsId]:
-                        self.pj[OBSERVATIONS][obsId]["media_info"] = {"length": {}, "fps": {}}
-                        if "length" not in self.pj[OBSERVATIONS][obsId]["media_info"]:
-                            self.pj[OBSERVATIONS][obsId]["media_info"]["length"] = {}
-                        if "fps" not in self.pj[OBSERVATIONS][obsId]["media_info"]:
-                            self.pj[OBSERVATIONS][obsId]["media_info"]["fps"] = {}
-
-                    self.pj[OBSERVATIONS][obsId]["media_info"]["length"][mediaFile] = videoDuration
-                    self.pj[OBSERVATIONS][obsId]["media_info"]["fps"][mediaFile] = fps
-
-                    mediaLength = videoDuration
-
-                totalMediaLength2 += Decimal(mediaLength)
-
-            if  totalMediaLength1  == -1 or totalMediaLength2 == -1:
-                totalMediaLength = -1
-                return totalMediaLength
-            else:
-                totalMediaLength = max(totalMediaLength1, totalMediaLength2)
-
-            # check if events are recorded after totalmedialength
-            if self.pj[OBSERVATIONS][obsId][EVENTS]:
-                if max(self.pj[OBSERVATIONS][obsId][EVENTS])[EVENT_TIME_FIELD_IDX] > totalMediaLength:
-                    totalMediaLength = max(self.pj[OBSERVATIONS][obsId][EVENTS])[EVENT_TIME_FIELD_IDX]
-
-            return totalMediaLength
-
-        return Decimal("0.0")
-
-    
-
     def plot_events1_triggered(self):
         """
         plot events with matplotlib (legacy version)
         """
-
-        def plot_time_ranges(obs, obsId, minTime, videoLength, excludeBehaviorsWithoutEvents, line_width):
-            """
-            create "hlines" matplotlib plot
-            """
-
-            import matplotlib.pyplot as plt
-            import matplotlib.transforms as mtransforms
-            from matplotlib import dates
-
-            LINE_WIDTH = line_width
-            all_behaviors, observedBehaviors = [], []
-            maxTime = 0  # max time in all events of all subjects
-
-            # all behaviors defined in project without modifiers
-            all_project_behaviors = [self.pj[ETHOGRAM][idx]["code"] for idx in sorted_keys(self.pj[ETHOGRAM])]
-            all_project_subjects = [NO_FOCAL_SUBJECT] + [self.pj[SUBJECTS][idx]["name"] for idx in sorted_keys(self.pj[SUBJECTS])]
-
-            for subject in obs:
-
-                for behavior_modifiers_json in obs[subject]:
-
-                    behavior_modifiers = json.loads(behavior_modifiers_json)
-
-                    if not excludeBehaviorsWithoutEvents:
-                        observedBehaviors.append(behavior_modifiers_json)
-                    else:
-                        if obs[subject][behavior_modifiers_json]:
-                            observedBehaviors.append(behavior_modifiers_json)
-
-                    if not behavior_modifiers_json in all_behaviors:
-                        all_behaviors.append(behavior_modifiers_json)
-
-                    for t1, t2 in obs[subject][behavior_modifiers_json]:
-                        maxTime = max(maxTime, t1, t2)
-
-                observedBehaviors.append("")
-
-            lbl = []
-            if excludeBehaviorsWithoutEvents:
-                for behav_modif_json in observedBehaviors:
-                    
-                    if not behav_modif_json:
-                        lbl.append("")
-                        continue
-                    
-                    behav_modif = json.loads(behav_modif_json)
-                    if len(behav_modif) == 2:
-                        lbl.append("{0} ({1})".format(behav_modif[0], behav_modif[1]))
-                    else:
-                        lbl.append(behav_modif[0])
-
-            else:
-                all_behaviors.append('[""]') # empty json list element
-                for behav_modif_json in all_behaviors:
-                    
-                    behav_modif = json.loads(behav_modif_json)
-                    if len(behav_modif) == 2:
-                        lbl.append("{0} ({1})".format(behav_modif[0], behav_modif[1]))
-                    else:
-                        lbl.append(behav_modif[0])
-                lbl = lbl[:] * len(obs)
-
-
-            lbl = lbl[:-1]  # remove last empty line
-
-            fig = plt.figure(figsize=(20, 10))
-            fig.suptitle("Time diagram of observation {}".format(obsId), fontsize=14)
-            ax = fig.add_subplot(111)
-            labels = ax.set_yticklabels(lbl)
-
-            ax.set_ylabel("Behaviors")
-
-            if self.timeFormat == HHMMSS:
-                fmtr = dates.DateFormatter("%H:%M:%S") # %H:%M:%S:%f
-                ax.xaxis.set_major_formatter(fmtr)
-                ax.set_xlabel("Time (hh:mm:ss)")
-            else:
-                ax.set_xlabel("Time (s)")
-
-            plt.ylim(len(lbl), -0.5)
-
-            if not videoLength:
-                videoLength = maxTime
-
-            if self.pj[OBSERVATIONS][obsId]["time offset"]:
-                t0 = round(self.pj[OBSERVATIONS][obsId]["time offset"] + minTime)
-                t1 = round(self.pj[OBSERVATIONS][obsId]["time offset"] + videoLength + 2)
-            else:
-                t0 = round(minTime)
-                t1 = round(videoLength)
-            subjectPosition = t0 + (t1 - t0) * 0.05
-
-            if self.timeFormat == HHMMSS:
-                t0d = datetime.datetime(1970, 1, 1, int(t0 / 3600), int((t0 - int(t0 / 3600) * 3600) / 60), int(t0 % 60), round(round(t0 % 1, 3) * 1000000))
-                t1d = datetime.datetime(1970, 1, 1, int(t1 / 3600), int((t1 - int(t1 / 3600) * 3600) / 60), int(t1 % 60), round(round(t1 % 1, 3) * 1000000))
-                subjectPositiond = datetime.datetime(1970, 1, 1, int(subjectPosition / 3600), int((subjectPosition - int(subjectPosition / 3600) * 3600) / 60), int(subjectPosition % 60), round(round(subjectPosition % 1, 3) * 1000000))
-
-            if self.timeFormat == S:
-                t0d, t1d = t0, t1
-                subjectPositiond = subjectPosition
-
-            plt.xlim(t0d, t1d)
-            plt.yticks(range(len(lbl) + 1), np.array(lbl))
-
-            count = 0
-            flagFirstSubject = True
-
-            for subject in all_project_subjects:
-                if subject not in obs:
-                    continue
-
-                if not flagFirstSubject:
-                    if excludeBehaviorsWithoutEvents:
-                        count += 1
-                    ax.axhline(y=(count-1), linewidth=1, color="black")
-                    ax.hlines(np.array([count]), np.array([0]), np.array([0]), lw=LINE_WIDTH, color=col)
-                else:
-                    flagFirstSubject = False
-
-                ax.text(subjectPositiond, count - 0.5, subject)
-
-                behaviors = obs[subject]
-
-                x1, x2, y, col, pointsx, pointsy, guide = [], [], [], [], [], [], []
-                col_count = 0
-
-                for bm_json in all_behaviors:
-                    if bm_json in obs[subject]:
-                        if obs[subject][bm_json]:
-                            for t1, t2 in obs[subject][bm_json]:
-                                if t1 == t2:
-                                    pointsx.append(t1)
-                                    pointsy.append(count)
-                                    ax.axhline(y=count, linewidth=1, color="lightgray", zorder=-1)
-                                else:
-                                    x1.append(t1)
-                                    x2.append(t2)
-                                    y.append(count)
-
-                                    #col.append(BEHAVIORS_PLOT_COLORS[all_project_behaviors.index(json.loads(bm_json)[0]) % len(BEHAVIORS_PLOT_COLORS)])
-                                    col.append(behavior_color(self.plot_colors, all_project_behaviors.index(json.loads(bm_json)[0])))
-                                    
-
-                                    ax.axhline(y=count, linewidth=1, color="lightgray", zorder=-1)
-                            count += 1
-                        else:
-                            x1.append(0)
-                            x2.append(0)
-                            y.append(count)
-                            col.append("white")
-                            ax.axhline(y=count, linewidth=1, color="lightgray", zorder=-1)
-                            count += 1
-
-                    else:
-                        if not excludeBehaviorsWithoutEvents:
-                            x1.append(0)
-                            x2.append(0)
-                            y.append(count)
-                            col.append("white")
-                            ax.axhline(y=count, linewidth=1, color="lightgray", zorder=-1)
-                            count += 1
-
-                    col_count += 1
-
-                if self.timeFormat == HHMMSS:
-                    ax.hlines(np.array(y), np.array([datetime.datetime(1970, 1, 1, int(p / 3600),
-                                                                       int((p - int(p / 3600) * 3600) / 60),
-                                                                       int(p % 60), round(round(p % 1, 3) * 1e6))
-                                                    for p in x1]),
-                    np.array([datetime.datetime(1970, 1, 1, int(p / 3600), int((p - int(p / 3600) * 3600) / 60), int(p % 60), round(round(p % 1, 3) * 1e6)) for p in x2]),
-                    lw=LINE_WIDTH, color=col)
-
-                if self.timeFormat == S:
-                    ax.hlines(np.array(y), np.array(x1), np.array(x2), lw=LINE_WIDTH, color=col)
-
-                if self.timeFormat == HHMMSS:
-                    ax.plot(np.array([datetime.datetime(1970, 1, 1, int(p / 3600), int((p - int(p / 3600) * 3600)/60), int(p % 60), round(round(p % 1, 3) * 1e6)) for p in pointsx]), pointsy, "r^")
-
-                if self.timeFormat == S:
-                    ax.plot(pointsx, pointsy, "r^")
-
-                #ax.axhline(y=y[-1] + 0.5,linewidth=1, color='black')
-
-            def on_draw(event):
-
-                # http://matplotlib.org/faq/howto_faq.html#move-the-edge-of-an-axes-to-make-room-for-tick-labels
-                bboxes = []
-                for label in labels:
-                    bbox = label.get_window_extent()
-                    bboxi = bbox.inverse_transformed(fig.transFigure)
-                    bboxes.append(bboxi)
-
-                bbox = mtransforms.Bbox.union(bboxes)
-                if fig.subplotpars.left < bbox.width:
-                    fig.subplots_adjust(left=1.1*bbox.width)
-                    fig.canvas.draw()
-                return False
-
-            fig.canvas.mpl_connect("draw_event", on_draw)
-            plt.show()
-
-            return True
 
         result, selectedObservations = self.selectObservations(SELECT1)
 
@@ -6364,16 +5644,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return
 
         for obsId in selectedObservations:
-            totalMediaLength = self.observationTotalMediaLength(obsId)
-            '''
-            if self.pj[OBSERVATIONS][obsId][TYPE] == MEDIA:
-                totalMediaLength = self.observationTotalMediaLength(obsId)
-            else: # LIVE
-                if self.pj[OBSERVATIONS][obsId][EVENTS]:
-                    totalMediaLength = max(self.pj[OBSERVATIONS][obsId][EVENTS])[0]
-                else:
-                    totalMediaLength = Decimal("0.0")
-            '''
+            
+            totalMediaLength = project_functions.observation_total_length(self.pj[OBSERVATIONS][obsId])
 
         if totalMediaLength == -1:
             totalMediaLength = 0
@@ -6385,7 +5657,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if not plot_parameters["selected subjects"] or not plot_parameters["selected behaviors"]:
             return
 
-        cursor = self.loadEventsInDB(plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
+        cursor = db_functions.load_events_in_db(self.pj, plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
 
         o = {}
 
@@ -6456,12 +5728,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                             if idx % 2 == 0:
                                 o[subject][behaviorOut_json].append([row[0], rows[idx + 1][0]])
 
-        logging.debug("intervals: {}".format(o))
-        logging.debug("totalMediaLength: {}".format(plot_parameters["end time"]))
-        logging.debug("excludeBehaviorsWithoutEvents: {}".format(plot_parameters["exclude behaviors"]))
-
-
-        if not plot_time_ranges(o,
+        if not plot_events.plot_time_ranges(self.pj,
+                                              self.timeFormat,
+                                              self.plot_colors,
+                                              o,
                                 selectedObservations[0],
                                 plot_parameters["start time"],
                                 plot_parameters["end time"],
@@ -6485,45 +5755,20 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         out = ""
         not_paired_obs_list = []
         for obsId in selectedObservations:
-            r, msg = self.check_state_events_obs(obsId)
+            r, msg = project_functions.check_state_events_obs(obsId, self.pj[ETHOGRAM],
+                                                              self.pj[OBSERVATIONS][obsId], self.timeFormat)
+
             if not r:
-                out += "<strong>{obsId}</strong><br>{msg}<br>".format(obsId=obsId, msg=msg)
+                out += "Observation: <strong>{obsId}</strong><br>{msg}<br>".format(obsId=obsId, msg=msg)
                 not_paired_obs_list.append(obsId)
 
         if out:
-            d = QDialog()
-            d.setWindowTitle("Check selected observations")
-            hbox = QVBoxLayout()
+            self.results = dialog.ResultsWidget()
+            self.results.setWindowTitle(programName + " - Check selected observations")
+            self.results.ptText.setReadOnly(True)
+            self.results.ptText.appendHtml(out)
+            self.results.show()
 
-            d.lb = QLabel("The following observations have some problems")
-            hbox.addWidget(d.lb)
-
-            d.ptText = QPlainTextEdit()
-            d.ptText.setReadOnly(True)
-            d.ptText.appendHtml(out)
-            hbox.addWidget(d.ptText)
-
-            hbox2 = QHBoxLayout()
-            d.pbOK = QPushButton("OK")
-            d.pbOK.clicked.connect(d.close)
-
-            hbox2.addWidget(d.pbOK)
-            hbox.addLayout(hbox2)
-
-            d.setLayout(hbox)
-
-            d.setWindowModality(Qt.ApplicationModal)
-            d.exec_()
-
-        '''
-        not_paired_obs_list = []
-        for obsId in selectedObservations:
-            if not self.check_state_events_obs(obsId)[0]:
-                not_paired_obs_list.append(obsId)
-
-        if not_paired_obs_list:
-            QMessageBox.warning(self, programName, "Some observations have unpaired state events:<br><b>{}</b>".format("</b>, <b>".join(not_paired_obs_list)))
-        '''        
         selectedObservations = [x for x in selectedObservations if x not in not_paired_obs_list]
         if not selectedObservations:
             return
@@ -6540,7 +5785,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         max_obs_length = -1
         for obsId in selectedObservations:
-            totalMediaLength = self.observationTotalMediaLength(obsId)
+            totalMediaLength = project_functions.observation_total_length(self.pj[OBSERVATIONS][obsId])
+
             if totalMediaLength == -1:
                 totalMediaLength = 0
 
@@ -6571,12 +5817,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 return
 
         totalMediaLength = int(totalMediaLength)
-        
-        cursor = self.loadEventsInDB(plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
+
+        cursor = db_functions.load_events_in_db(self.pj, plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
 
         for obsId in selectedObservations:
 
-            obs_length = self.observationTotalMediaLength(obsId)
+            obs_length = project_functions.observation_total_length(self.pj[OBSERVATIONS][obsId])
+
             if obs_length == -1:
                 obs_length = 0
 
@@ -6671,9 +5918,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 max_time = float(plot_parameters["end time"])
 
             if len(selectedObservations) > 1:
-                output_file_name = "{plot_directory}/{obsId}.{file_format}".format(plot_directory=plot_directory,
-                                                                                   obsId=safeFileName(obsId),
-                                                                                   file_format=file_format)
+                output_file_name = str(pathlib.Path(pathlib.Path(plot_directory) / safeFileName(obsId)).with_suffix("." + file_format))
             else:
                 output_file_name = ""
 
@@ -6690,240 +5935,38 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 QMessageBox.critical(self, programName, ret["msg"])
 
 
-    def convert_time_to_decimal(self, pj):
+    def load_project(self, project_path, project_changed, pj):
         """
-        convert time from float to decimal
+        load specified project
         """
-
-        for obsId in pj[OBSERVATIONS]:
-            if "time offset" in pj[OBSERVATIONS][obsId]:
-                pj[OBSERVATIONS][obsId]["time offset"] = Decimal(str(pj[OBSERVATIONS][obsId]["time offset"]))
-            for idx, event in enumerate(pj[OBSERVATIONS][obsId][EVENTS]):
-                pj[OBSERVATIONS][obsId][EVENTS][idx][pj_obs_fields["time"]] = Decimal(str(pj[OBSERVATIONS][obsId][EVENTS][idx][pj_obs_fields["time"]]))
-
-        return pj
-
-
-    def open_project_json(self, projectFileName):
-        """
-        open project json
-        """
-        logging.debug("open project: {0}".format(projectFileName))
-
-        if not os.path.isfile(projectFileName):
-            QMessageBox.warning(self, programName, "File not found")
-            return
-
-        s = open(projectFileName, "r").read()
-
-        try:
-            self.pj = json.loads(s)
-        except:
-            QMessageBox.critical(self, programName, "This project file seems corrupted")
-            return
-
-        self.projectChanged = False
-
-        # transform time to decimal
-        self.pj = self.convert_time_to_decimal(self.pj)
-
-        # add coding_map key to old project files
-        if not "coding_map" in self.pj:
-            self.pj["coding_map"] = {}
-            self.projectChanged = True
-
-        # add subject description
-        if "project_format_version" in self.pj:
-            for idx in [x for x in self.pj[SUBJECTS]]:
-                if not "description" in self.pj[SUBJECTS][idx]:
-                    self.pj[SUBJECTS][idx]["description"] = ""
-                    self.projectChanged = True
-
-        # check if project file version is newer than current BORIS project file version
-        if "project_format_version" in self.pj and Decimal(self.pj["project_format_version"]) > Decimal(project_format_version):
-            QMessageBox.critical(self, programName, ("This project file was created with a more recent version of BORIS.\n"
-                                                     "You must update BORIS to open it"))
-            return
-
-
-        # check if old version  v. 0 *.obs
-        if "project_format_version" not in self.pj:
-
-            # convert VIDEO, AUDIO -> MEDIA
-            self.pj['project_format_version'] = project_format_version
-            self.projectChanged = True
-
-            for obs in [x for x in self.pj[OBSERVATIONS]]:
-
-                # remove 'replace audio' key
-                if "replace audio" in self.pj[OBSERVATIONS][obs]:
-                    del self.pj[OBSERVATIONS][obs]['replace audio']
-
-                if self.pj[OBSERVATIONS][obs][TYPE] in ['VIDEO', 'AUDIO']:
-                    self.pj[OBSERVATIONS][obs][TYPE] = MEDIA
-
-                # convert old media list in new one
-                if len(self.pj[OBSERVATIONS][obs][FILE]):
-                    d1 = {PLAYER1: [self.pj[OBSERVATIONS][obs][FILE][0]]}
-
-                if len(self.pj[OBSERVATIONS][obs][FILE]) == 2:
-                    d1[PLAYER2] = [self.pj[OBSERVATIONS][obs][FILE][1]]
-
-                self.pj[OBSERVATIONS][obs][FILE] = d1
-
-            # convert VIDEO, AUDIO -> MEDIA
-            for idx in [x for x in self.pj[SUBJECTS]]:
-                key, name = self.pj[SUBJECTS][idx]
-                self.pj[SUBJECTS][idx] = {"key": key, "name": name, "description": ""}
-            QMessageBox.information(self, programName, ("The project file was converted to the new format (v. {}) in use with your version of BORIS.<br>"
-                                                        "Choose a new file name for saving it.").format(project_format_version))
-            projectFileName = ''
-
-        '''
-        if not 'project_media_file_info' in self.pj:
-            self.pj['project_media_file_info'] = {}
-            self.projectChanged = True
-
-        if not 'project_media_file_info' in self.pj:
-            for obs in self.pj[OBSERVATIONS]:
-                if 'media_file_info' in self.pj[OBSERVATIONS][obs]:
-                    for h in self.pj[OBSERVATIONS][obs]['media_file_info']:
-                        self.pj['project_media_file_info'][h] = self.pj[OBSERVATIONS][obs]['media_file_info'][h]
-                        self.projectChanged = True
-        '''
-
-        for obs in self.pj[OBSERVATIONS]:
-            if not "time offset second player" in self.pj[OBSERVATIONS][obs]:
-                self.pj[OBSERVATIONS][obs]["time offset second player"] = Decimal("0.0")
-                self.projectChanged = True
-
-        # update modifiers to JSON format
-
-        project_lowerthan4 = False
-
-        logging.debug("project_format_version: {}".format(versiontuple(self.pj["project_format_version"])))
-
-        if "project_format_version" in self.pj and versiontuple(self.pj["project_format_version"]) < versiontuple("4.0"):
-
-            for idx in self.pj[ETHOGRAM]:
-                if self.pj[ETHOGRAM][idx]["modifiers"]:
-                    if isinstance(self.pj[ETHOGRAM][idx]["modifiers"], str):
-                        project_lowerthan4 = True
-                        modif_set_list = self.pj[ETHOGRAM][idx]["modifiers"].split("|")
-                        modif_set_dict = {}
-                        for modif_set in modif_set_list:
-                            modif_set_dict[str(len(modif_set_dict))] = {"name": "", "type": SINGLE_SELECTION, "values": modif_set.split(",")}
-                        self.pj[ETHOGRAM][idx]["modifiers"] = dict(modif_set_dict)
-                else:
-                    self.pj[ETHOGRAM][idx]["modifiers"] = {}
-
-            if not project_lowerthan4:
-                QMessageBox.information(self, programName, "The project version was updated from {} to {}".format(self.pj["project_format_version"], project_format_version))
-                self.pj["project_format_version"] = project_format_version
-                self.projectChanged = True
-
-
-        # add category key if not found
-        for idx in self.pj[ETHOGRAM]:
-            if "category" not in self.pj[ETHOGRAM][idx]:
-                self.pj[ETHOGRAM][idx]["category"] = ""
-
-        logging.debug("project_lowerthan4: {}".format(project_lowerthan4))
-
-        if project_lowerthan4:
-
-            from shutil import copyfile
-            copyfile(projectFileName, projectFileName.replace(".boris", "_old_version.boris"))
-
-            QMessageBox.information(self, programName, ("The project was updated to the current project version ({project_format_version}).\n\n"
-                                                        "The old file project was saved as {project_file_name}").format(project_format_version=project_format_version,
-                                                                                                                         project_file_name=projectFileName.replace(".boris", "_old_version.boris")))
-
-
-        # if one file is present in player #1 -> set "media_info" key with value of media_file_info
-        project_updated = False
-
-        for obs in self.pj[OBSERVATIONS]:
-            if self.pj[OBSERVATIONS][obs][TYPE] in [MEDIA] and "media_info" not in self.pj[OBSERVATIONS][obs]:
-                self.pj[OBSERVATIONS][obs]['media_info'] = {"length": {}, "fps": {}, "hasVideo": {}, "hasAudio": {}}
-                for player in [PLAYER1, PLAYER2]:
-                    # fix bug Anne Maijer 2017-07-17
-                    if self.pj[OBSERVATIONS][obs]["file"] == []:
-                        self.pj[OBSERVATIONS][obs]["file"] = {"1": [], "2": []}
-
-                    for media_file_path in self.pj[OBSERVATIONS][obs]["file"][player]:
-                        nframe, videoTime, videoDuration, fps, hasVideo, hasAudio = accurate_media_analysis(self.ffmpeg_bin, media_file_path)
-
-                        if videoDuration:
-                            self.pj[OBSERVATIONS][obs]['media_info']["length"][media_file_path] = videoDuration
-                            self.pj[OBSERVATIONS][obs]['media_info']["fps"][media_file_path] = fps
-                            self.pj[OBSERVATIONS][obs]['media_info']["hasVideo"][media_file_path] = hasVideo
-                            self.pj[OBSERVATIONS][obs]['media_info']["hasAudio"][media_file_path] = hasAudio
-                            project_updated, self.projectChanged = True, True
-                        else:  # file path not found
-                            if ("media_file_info" in self.pj[OBSERVATIONS][obs]
-                                and len(self.pj[OBSERVATIONS][obs]["media_file_info"]) == 1
-                                and len(self.pj[OBSERVATIONS][obs]["file"][PLAYER1]) == 1
-                                and len(self.pj[OBSERVATIONS][obs]["file"][PLAYER2]) == 0):
-                                    media_md5_key = list(self.pj[OBSERVATIONS][obs]["media_file_info"].keys())[0]
-                                    # duration
-                                    self.pj[OBSERVATIONS][obs]["media_info"] = {"length": {media_file_path:
-                                             self.pj[OBSERVATIONS][obs]["media_file_info"][media_md5_key]["video_length"]/1000}}
-                                    project_updated, self.projectChanged = True, True
-
-                                    # FPS
-                                    if "nframe" in self.pj[OBSERVATIONS][obs]["media_file_info"][media_md5_key]:
-                                        self.pj[OBSERVATIONS][obs]['media_info']['fps'] = {media_file_path:
-                                             self.pj[OBSERVATIONS][obs]['media_file_info'][media_md5_key]['nframe']
-                                             / (self.pj[OBSERVATIONS][obs]['media_file_info'][media_md5_key]['video_length']/1000)}
-                                    else:
-                                        self.pj[OBSERVATIONS][obs]['media_info']['fps'] = {media_file_path: 0}
-
-
-        '''
-            try:
-                if (not "media_info" in self.pj[OBSERVATIONS][obs]
-                    and len(self.pj[OBSERVATIONS][obs]["media_file_info"]) == 1
-                    and len(self.pj[OBSERVATIONS][obs]["file"][PLAYER1]) == 1
-                    and len(self.pj[OBSERVATIONS][obs]["file"][PLAYER2]) == 0):
-                        self.pj[OBSERVATIONS][obs]['media_info'] = {"length": {self.pj[OBSERVATIONS][obs]['file'][PLAYER1][0]:
-                               self.pj[OBSERVATIONS][obs]['media_file_info'][list(self.pj[OBSERVATIONS][obs]['media_file_info'].keys())[0]]['video_length']/1000}}
-                        # FPS
-                        if "nframe" in self.pj[OBSERVATIONS][obs]["media_file_info"][list(self.pj[OBSERVATIONS][obs]["media_file_info"].keys())[0]]:
-                            self.pj[OBSERVATIONS][obs]['media_info']['fps'] = {self.pj[OBSERVATIONS][obs]['file'][PLAYER1][0]:
-                                self.pj[OBSERVATIONS][obs]['media_file_info'][list(self.pj[OBSERVATIONS][obs]['media_file_info'].keys())[0]]['nframe'] / ( self.pj[OBSERVATIONS][obs]['media_file_info'][list(self.pj[OBSERVATIONS][obs]['media_file_info'].keys())[0]]['video_length']/1000)
-                                 }
-                        else:
-                            self.pj[OBSERVATIONS][obs]['media_info']['fps'] = {self.pj[OBSERVATIONS][obs]['file'][PLAYER1][0]: 0}
-                        self.projectChanged = True
-
-
-            except:
-                pass
-        '''
-        if project_updated:
-            QMessageBox.information(self, programName, "The media files information was updated to the new project format.")
-
-
-
-
-        # check program version
-        memProjectChanged = self.projectChanged
+        self.pj = copy.deepcopy(pj)
+        memProjectChanged = project_changed
         self.initialize_new_project()
         self.projectChanged = True
         self.projectChanged = memProjectChanged
         self.load_behaviors_in_twEthogram([self.pj[ETHOGRAM][x]["code"] for x in self.pj[ETHOGRAM]])
         self.load_subjects_in_twSubjects([self.pj[SUBJECTS][x]["name"] for x in self.pj[SUBJECTS]])
-        self.projectFileName = projectFileName
+        self.projectFileName = str(pathlib.Path(project_path).absolute())
         self.project = True
+        if str(self.projectFileName) not in self.recent_projects:
+            self.recent_projects = [str(self.projectFileName)] + self.recent_projects
+            self.recent_projects = self.recent_projects[:10]
+            self.set_recent_projects_menu()
         self.menu_options()
 
 
     def open_project_activated(self):
+        """
+        open a project
+        triggered by Open project menu and recent projects submenu
+        """
+
+        action = self.sender()
 
         # check if current observation
         if self.observationId:
-            if dialog.MessageDialog(programName, "There is a current observation. What do you want to do?", ["Close observation", "Continue observation"]) == "Close observation":
+            if dialog.MessageDialog(programName, "There is a current observation. What do you want to do?",
+                                    ["Close observation", "Continue observation"]) == "Close observation":
                 self.close_observation()
             else:
                 return
@@ -6938,24 +5981,36 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             if response == CANCEL:
                 return
 
-        fn = QFileDialog(self).getOpenFileName(self, "Open project", "", "Project files (*.boris);;All files (*)")
-        fileName = fn[0] if type(fn) is tuple else fn
+        if action.text() == "Open project":
+            fn = QFileDialog(self).getOpenFileName(self, "Open project", "", "Project files (*.boris);;All files (*)")
+            fileName = fn[0] if type(fn) is tuple else fn
+
+        else: # recent project
+            fileName = action.text()
 
         if fileName:
-            self.open_project_json(fileName)
+            project_path, project_changed, pj, msg = project_functions.open_project_json(fileName)
+
+            if "error" in pj:
+                logging.debug(pj["error"])
+                QMessageBox.critical(self, programName, pj["error"])
+            else:
+                if msg:
+                    QMessageBox.information(self, programName, msg)
+
+                self.load_project(project_path, project_changed, pj)
 
 
-    def initialize_new_project(self):
+    def initialize_new_project(self, flag_new=True):
         """
         initialize interface and variables for a new or edited project
         """
         logging.debug("initialize new project...")
 
-        self.lbLogoUnito.setVisible(False)
-        self.lbLogoBoris.setVisible(False)
-
-        self.dwEthogram.setVisible(True)
-        self.dwSubjects.setVisible(True)
+        self.lbLogoUnito.setVisible(not flag_new)
+        self.lbLogoBoris.setVisible(not flag_new)
+        self.dwEthogram.setVisible(flag_new)
+        self.dwSubjects.setVisible(flag_new)
 
 
     def close_project(self):
@@ -6965,7 +6020,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         # check if current observation
         if self.observationId:
-            response = dialog.MessageDialog(programName, "There is a current observation. What do you want to do?", ["Close observation", "Continue observation"])
+            response = dialog.MessageDialog(programName, "There is a current observation. What do you want to do?",
+                                            ["Close observation", "Continue observation"])
             if response == "Close observation":
                 self.close_observation()
             if response == "Continue observation":
@@ -6981,32 +6037,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             if response == CANCEL:
                 return
 
-        self.dwEthogram.setVisible(False)
-        self.dwSubjects.setVisible(False)
 
         self.projectChanged = False
         self.setWindowTitle(programName)
 
-        self.pj = {"time_format": self.timeFormat,
-                   "project_date": "",
-                   "project_name": "",
-                   "project_description": "",
-                   SUBJECTS: {},
-                   ETHOGRAM: {},
-                   OBSERVATIONS: {},
-                   BEHAVIORAL_CATEGORIES: [],
-                   INDEPENDENT_VARIABLES: {},
-                   "coding_map": {}}
+        self.pj = dict(EMPTY_PROJECT)
 
         self.project = False
-
         self.readConfigFile()
-
         self.menu_options()
+        
+        self.initialize_new_project(flag_new=False)
 
-        self.lbLogoUnito.setVisible(True)
-        self.lbLogoBoris.setVisible(True)
-
+        self.lb_current_media_time.setVisible(False)
         self.lbFocalSubject.setVisible(False)
         self.lbCurrentStates.setVisible(False)
 
@@ -7014,7 +6057,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def convertTime(self, sec):
         """
         convert time in base of current format
-        return string
+        
+        Args:
+            sec: time in seconds
+
+        Returns:
+            string: time in base of current format (self.timeFormat S or HHMMSS)
         """
 
         if self.timeFormat == S:
@@ -7023,10 +6071,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if self.timeFormat == HHMMSS:
             return seconds2time(sec)
 
+
     def edit_project(self, mode):
         """
         project management
-        mode: new/edit
+        
+        Args:
+            mode (str): new/edit 
         """
 
         logging.debug("self.projectChanged: {}".format(self.projectChanged))
@@ -7048,22 +6099,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     return
 
             # empty main window tables
-            self.twEthogram.setRowCount(0)   # behaviors
-            self.twSubjects.setRowCount(0)
-            self.twEvents.setRowCount(0)
+            for w in [self.twEthogram, self.twSubjects, self.twEvents]:
+                w.setRowCount(0)   # behaviors
 
         newProjectWindow = projectDialog(logging.getLogger().getEffectiveLevel())
-        
-
-        # TODO: remove when behav coding map ready
-        #newProjectWindow.tabProject.setTabEnabled(5, False) 
-
 
         # pass copy of self.pj
         newProjectWindow.pj = copy.deepcopy(self.pj)
 
         if self.projectWindowGeometry:
             newProjectWindow.restoreGeometry(self.projectWindowGeometry)
+        else:
+            newProjectWindow.resize(800, 400)
 
         newProjectWindow.setWindowTitle(mode + " project")
         newProjectWindow.tabProject.setCurrentIndex(0)   # project information
@@ -7141,41 +6188,21 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             # configuration of behaviours
             if newProjectWindow.pj[ETHOGRAM]:
 
-                newProjectWindow.signalMapper = QSignalMapper(self)
-                newProjectWindow.comboBoxes = []
-
                 for i in sorted_keys(newProjectWindow.pj[ETHOGRAM]):
-
                     newProjectWindow.twBehaviors.setRowCount(newProjectWindow.twBehaviors.rowCount() + 1)
-
                     for field in behavioursFields:
-
                         item = QTableWidgetItem()
-
                         if field == TYPE:
-
-                            # add combobox with event type
-                            newProjectWindow.comboBoxes.append(QComboBox())
-                            newProjectWindow.comboBoxes[-1].addItems(BEHAVIOR_TYPES)
-                            newProjectWindow.comboBoxes[-1].setCurrentIndex(BEHAVIOR_TYPES.index(newProjectWindow.pj[ETHOGRAM][i][field]))
-
-                            newProjectWindow.signalMapper.setMapping(newProjectWindow.comboBoxes[-1], newProjectWindow.twBehaviors.rowCount() - 1)
-                            newProjectWindow.comboBoxes[-1].currentIndexChanged["int"].connect(newProjectWindow.signalMapper.map)
-
-                            newProjectWindow.twBehaviors.setCellWidget(newProjectWindow.twBehaviors.rowCount() - 1, behavioursFields[field], newProjectWindow.comboBoxes[-1])
-
+                            item.setText(DEFAULT_BEHAVIOR_TYPE)
+                        if field in newProjectWindow.pj[ETHOGRAM][i]:
+                            item.setText(str(newProjectWindow.pj[ETHOGRAM][i][field]))  # str for modifiers dict
                         else:
-                            if field in newProjectWindow.pj[ETHOGRAM][i]:
-                                item.setText(str(newProjectWindow.pj[ETHOGRAM][i][field]))  # str for modifiers dict
-                            else:
-                                item.setText("")
+                            item.setText("")
+                        if field in [TYPE, "category", "excluded", "coding map", "modifiers"]:
+                            item.setFlags(Qt.ItemIsEnabled)
+                            item.setBackground(QColor(230, 230, 230))
 
-                            if field in ["category", "excluded", "coding map", "modifiers"]:
-                                item.setFlags(Qt.ItemIsEnabled)
-
-                            newProjectWindow.twBehaviors.setItem(newProjectWindow.twBehaviors.rowCount() - 1, behavioursFields[field], item)
-
-                newProjectWindow.signalMapper.mapped["int"].connect(newProjectWindow.behaviorTypeChanged)
+                        newProjectWindow.twBehaviors.setItem(newProjectWindow.twBehaviors.rowCount() - 1, behavioursFields[field], item)
 
                 newProjectWindow.twBehaviors.resizeColumnsToContents()
 
@@ -7183,7 +6210,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             if INDEPENDENT_VARIABLES in newProjectWindow.pj:
                 for i in sorted_keys(newProjectWindow.pj[INDEPENDENT_VARIABLES]):
                     newProjectWindow.twVariables.setRowCount(newProjectWindow.twVariables.rowCount() + 1)
-
                     for idx, field in enumerate(tw_indVarFields):
                         item = QTableWidgetItem("")
                         if field in newProjectWindow.pj[INDEPENDENT_VARIABLES][i]:
@@ -7193,34 +6219,25 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 newProjectWindow.twVariables.resizeColumnsToContents()
 
+            # behaviors coding map
             if BEHAVIORS_CODING_MAP in newProjectWindow.pj:
                 for bcm in newProjectWindow.pj[BEHAVIORS_CODING_MAP]:
                     newProjectWindow.twBehavCodingMap.setRowCount(newProjectWindow.twBehavCodingMap.rowCount() + 1)
-                    #for idx, field in enumerate(BEHAV_CODING_MAP_FIELDS):
-                    #item = 
                     newProjectWindow.twBehavCodingMap.setItem(newProjectWindow.twBehavCodingMap.rowCount() - 1, 0, QTableWidgetItem(bcm["name"]))
                     codes = ", ".join([bcm["areas"][idx]["code"] for idx in bcm["areas"]])
                     newProjectWindow.twBehavCodingMap.setItem(newProjectWindow.twBehavCodingMap.rowCount() - 1, 1, QTableWidgetItem(codes))
 
+            # time converters
+            if CONVERTERS in newProjectWindow.pj:
+                newProjectWindow.converters = newProjectWindow.pj[CONVERTERS]
+                newProjectWindow.load_converters_in_table()
+
         newProjectWindow.dteDate.setDisplayFormat("yyyy-MM-dd hh:mm:ss")
 
         if mode == NEW:
+            newProjectWindow.pj = copy.deepcopy(EMPTY_PROJECT)
 
-            newProjectWindow.pj = {"time_format": HHMMSS,
-                       "project_date": "",
-                       "project_name": "",
-                       "project_description": "",
-                       "project_format_version": project_format_version,
-                       SUBJECTS: {},
-                       ETHOGRAM: {},
-                       OBSERVATIONS: {},
-                       BEHAVIORAL_CATEGORIES: [],
-                       INDEPENDENT_VARIABLES: {},
-                       CODING_MAP: {},
-                       BEHAVIORS_CODING_MAP: []}
-
-
-        if newProjectWindow.exec_():  # button OK
+        if newProjectWindow.exec_():  # button OK returns True
 
             if mode == NEW:
                 self.projectFileName = ""
@@ -7231,7 +6248,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             # retrieve project dict from window
             self.pj = copy.deepcopy(newProjectWindow.pj)
-
             self.project = True
 
             # time format
@@ -7399,9 +6415,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     self.textButton.setText("Live observation stopped (scan sampling)")
 
 
-
-
-
     def start_live_observation(self):
         """
         activate the live observation mode (without media file)
@@ -7448,433 +6461,174 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         create subtitles for selected observations, subjects and behaviors
         """
 
-        result, selectedObservations = self.selectObservations(MULTIPLE)
-
-        logging.debug("Selected observations: {0}".format(selectedObservations))
-
-        if not selectedObservations:
+        result, selected_observations = self.selectObservations(MULTIPLE)
+        if not selected_observations:
             return
 
-        plot_parameters = self.choose_obs_subj_behav_category(selectedObservations, 0)
-
-        if not plot_parameters["selected subjects"] or not plot_parameters["selected behaviors"]:
+        parameters = self.choose_obs_subj_behav_category(selected_observations, 0)
+        if not parameters["selected subjects"] or not parameters["selected behaviors"]:
             return
-
-        exportDir = QFileDialog(self).getExistingDirectory(self, "Choose a directory to save subtitles", os.path.expanduser("~"), options=QFileDialog(self).ShowDirsOnly)
-        if not exportDir:
+        export_dir = QFileDialog(self).getExistingDirectory(self, "Choose a directory to save subtitles", os.path.expanduser("~"),
+                                                            options=QFileDialog(self).ShowDirsOnly)
+        if not export_dir:
             return
-
-        cursor = self.loadEventsInDB(plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
-
-        flagUnpairedEventFound = False
-
-        for obsId in selectedObservations:
-
-            for nplayer in [PLAYER1, PLAYER2]:
-
-                if not self.pj[OBSERVATIONS][obsId][FILE][nplayer]:
-                    continue
-
-                duration1 = []   # in seconds
-                for mediaFile in self.pj[OBSERVATIONS][obsId][FILE][nplayer]:
-                    duration1.append(self.pj[OBSERVATIONS][obsId]["media_info"]["length"][mediaFile])
-
-                subtitles = {}
-                for subject in plot_parameters["selected subjects"]:
-
-                    for behavior in plot_parameters["selected behaviors"]:
-
-                        cursor.execute("SELECT occurence, modifiers FROM events where observation = ? AND subject = ? AND  code = ? ORDER BY code, occurence",
-                                       (obsId, subject, behavior))
-                        rows = list(cursor.fetchall())
-                        if STATE in self.eventType(behavior).upper() and len(rows) % 2:
-                            #continue
-                            flagUnpairedEventFound = True
-                            continue
-
-                        for idx, row in enumerate(rows):
-
-                            mediaFileIdx = [idx1 for idx1, x in enumerate(duration1) if row["occurence"] >= sum(duration1[0:idx1])][-1]
-                            if mediaFileIdx not in subtitles:
-                                subtitles[mediaFileIdx] = []
-
-                            # subtitle color
-                            if subject == NO_FOCAL_SUBJECT:
-                                col = "white"
-                            else:
-                                col = subtitlesColors[plot_parameters["selected subjects"].index(subject) % len(subtitlesColors)]
-
-                            behaviorStr = behavior
-                            if plot_parameters["include modifiers"] and row[1]:
-                                behaviorStr += " ({0})".format(row[1].replace("|", ", "))
-
-                            if POINT in self.eventType(behavior).upper():
-                                laps =  "{0} --> {1}".format(seconds2time(row["occurence"]).replace(".", ","), seconds2time(row["occurence"] + 0.5).replace(".", ","))
-                                subtitles[mediaFileIdx].append([laps, """<font color="{0}">{1}: {2}</font>""".format(col, subject, behaviorStr)])
-
-                            if STATE in self.eventType(behavior).upper():
-                                if idx % 2 == 0:
-
-                                    start = seconds2time(round(row["occurence"] - sum(duration1[0:mediaFileIdx]), 3)).replace(".", ",")
-                                    stop = seconds2time(round(rows[idx + 1]["occurence"] - sum(duration1[0:mediaFileIdx]), 3)).replace(".", ",")
-
-                                    laps =  "{start} --> {stop}".format(start=start, stop=stop)
-                                    subtitles[mediaFileIdx].append([laps, """<font color="{0}">{1}: {2}</font>""".format(col, subject, behaviorStr)])
-
-
-                try:
-                    for mediaIdx in subtitles:
-                        subtitles[mediaIdx].sort()
-                        with open("{exportDir}{sep}{fileName}.srt".format(exportDir=exportDir, sep=os.sep, fileName=os.path.basename(self.pj[OBSERVATIONS][obsId][FILE][nplayer][mediaIdx])), "w") as f:
-                            for idx, sub in enumerate(subtitles[mediaIdx]):
-                                f.write("{0}{3}{1}{3}{2}{3}{3}".format(idx + 1, sub[0], sub[1], "\n"))
-                except:
-                    errorMsg = sys.exc_info()[1]
-                    logging.critical(errorMsg)
-                    QMessageBox.critical(None, programName, str(errorMsg), QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-
-
-        self.statusbar.showMessage("Subtitles file(s) created in {} directory".format(exportDir), 0)
+        ok, msg = project_functions.create_subtitles(self.pj, selected_observations, parameters, export_dir)
+        if not ok:
+            logging.critical(msg)
+            QMessageBox.critical(None, programName, msg, QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
 
 
     def export_aggregated_events(self):
         """
-        export aggregated events in SQL (sql) or Tabular format (tsv, csv, ods, xlsx, xls, html)
+        export aggregated events.
+        Formats can be SQL (sql), SDIS (sds) or Tabular format (tsv, csv, ods, xlsx, xls, html)
         format is selected using the filename extension
         """
 
         result, selectedObservations = self.selectObservations(MULTIPLE)
-
         if not selectedObservations:
             return
 
         # check if state events are paired
-        out = ""
-        not_paired_obs_list = []
+        out, not_paired_obs_list = "", []
         for obsId in selectedObservations:
-            r, msg = self.check_state_events_obs(obsId)
+            r, msg = project_functions.check_state_events_obs(obsId, self.pj[ETHOGRAM],
+                                                              self.pj[OBSERVATIONS][obsId], self.timeFormat)
             if not r:
-                out += "<strong>{obsId}</strong><br>{msg}<br>".format(obsId=obsId, msg=msg)
+                out += "Observation: <strong>{obsId}</strong><br>{msg}<br>".format(obsId=obsId, msg=msg)
                 not_paired_obs_list.append(obsId)
-
         if out:
-            d = QDialog()
-            d.setWindowTitle("Check selected observations")
-            hbox = QVBoxLayout()
-
-            d.lb = QLabel("The following observations have some problems")
-            hbox.addWidget(d.lb)
-
-            d.ptText = QPlainTextEdit()
-            d.ptText.setReadOnly(True)
-            d.ptText.appendHtml(out)
-            hbox.addWidget(d.ptText)
-
-            hbox2 = QHBoxLayout()
-            d.pbOK = QPushButton("OK")
-            d.pbOK.clicked.connect(d.close)
-
-            hbox2.addWidget(d.pbOK)
-            hbox.addLayout(hbox2)
-
-            d.setLayout(hbox)
-
-            d.setWindowModality(Qt.ApplicationModal)
-            d.exec_()
-
-        plot_parameters = self.choose_obs_subj_behav_category(selectedObservations, maxTime=0, flagShowIncludeModifiers=False, flagShowExcludeBehaviorsWoEvents=False)
-
-        if not plot_parameters["selected subjects"] or not plot_parameters["selected behaviors"]:
+            self.results = dialog.ResultsWidget()
+            self.results.setWindowTitle(programName + " - Check selected observations")
+            self.results.ptText.setReadOnly(True)
+            self.results.ptText.appendHtml(out)
+            self.results.show()
             return
 
-        includeMediaInfo = None
-        for obsId in selectedObservations:
-            if self.pj[OBSERVATIONS][obsId][TYPE] in [MEDIA]:
-                includeMediaInfo = YES
-                break
+        parameters = self.choose_obs_subj_behav_category(selectedObservations, maxTime=0, flagShowIncludeModifiers=False,
+                                                         flagShowExcludeBehaviorsWoEvents=False)
 
-        fileFormats = ("Tab Separated Values (*.txt *.tsv);;"
-                       "Comma Separated Values (*.txt *.csv);;"
-                       "Open Document Spreadsheet ODS (*.ods);;"
-                       "Microsoft Excel Spreadsheet XLSX (*.xlsx);;"
-                       "Legacy Microsoft Excel Spreadsheet XLS (*.xls);;"
-                       "HTML (*.html);;"
-                       "SDIS (*.sds);;"
-                       "SQL dump file file (*.sql);;"
-                       "All files (*)")
-        while True:
+        if not parameters["selected subjects"] or not parameters["selected behaviors"]:
+            return
+
+        # check for grouping results
+        flag_group = True
+        if len(selectedObservations) > 1:
+            flag_group = dialog.MessageDialog(programName, "Group events from selected observations in one file?", [YES, NO]) == YES
+
+        extended_file_formats = ["Tab Separated Values (*.tsv)",
+                                 "Comma Separated Values (*.csv)",
+                                 "Open Document Spreadsheet ODS (*.ods)",
+                                 "Microsoft Excel Spreadsheet XLSX (*.xlsx)",
+                                 "Legacy Microsoft Excel Spreadsheet XLS (*.xls)",
+                                 "HTML (*.html)",
+                                 "SDIS (*.sds)",
+                                 "SQL dump file (*.sql)"]
+
+        if flag_group:
+            file_formats = ["tsv", "csv", "ods", "xlsx", "xls", "html", "sds", "sql"] # must be in same order than extended_file_formats
+    
             if QT_VERSION_STR[0] == "4":
-                fileName, filter_ = QFileDialog(self).getSaveFileNameAndFilter(self, "Export aggregated events", "", fileFormats)
+                fileName, filter_ = QFileDialog(self).getSaveFileNameAndFilter(self, "Export aggregated events", "", ";;".join(extended_file_formats))
             else:
-                fileName, filter_ = QFileDialog(self).getSaveFileName(self, "Export aggregated events", "", fileFormats)
-
+                fileName, filter_ = QFileDialog(self).getSaveFileName(self, "Export aggregated events", "", ";;".join(extended_file_formats))
+    
             if not fileName:
                 return
+    
+            outputFormat = file_formats[extended_file_formats.index(filter_)]
+            if pathlib.Path(fileName).suffix != "." + outputFormat:
+                fileName = str(pathlib.Path(fileName)) + "." + outputFormat
 
-            outputFormat = ""
-            availableFormats = ("tsv", "csv", "ods", "xlsx)", "xls)", "html", "sql", "sds")
-            for fileExtension in availableFormats:
-                if fileExtension in filter_:
-                    outputFormat = fileExtension.replace(")", "")
+        else: # not grouping
 
-            if not outputFormat:
-                QMessageBox.warning(self, programName, "Choose a file format", QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-            else:
-                break
+            items = ("Tab Separated Values (*.tsv)",
+                     "Comma Separated values (*.csv)",
+                     "Open Document Spreadsheet (*.ods)",
+                     "Microsoft Excel Spreadsheet XLSX (*.xlsx)",
+                     "Legacy Microsoft Excel Spreadsheet XLS (*.xls)",
+                     "HTML (*.html)")
+            item, ok = QInputDialog.getItem(self, "Export events format", "Available formats", items, 0, False)
+            if not ok:
+                return
+            outputFormat = re.sub(".* \(\*\.", "", item)[:-1]
 
-        if not outputFormat:
-            QMessageBox.warning(self, programName, "The file extension must be in {}".format(" ".join(availableFormats)), QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-            return
+            exportDir = QFileDialog(self).getExistingDirectory(self, "Choose a directory to export events", os.path.expanduser("~"),
+                                                               options=QFileDialog.ShowDirsOnly)
+            if not exportDir:
+                return
+
 
         if outputFormat == "sql":
-            out = "CREATE TABLE events (id INTEGER PRIMARY KEY ASC, observation TEXT, date DATE, media_file TEXT, subject TEXT, behavior TEXT, modifiers TEXT, event_type TEXT, start FLOAT, stop FLOAT, comment_start TEXT, comment_stop TEXT);" + "\n"
-            out += "BEGIN TRANSACTION;\n"
-            template = """INSERT INTO events (observation, date, media_file, subject, behavior, modifiers, event_type, start, stop, comment_start, comment_stop) VALUES ("{observation}","{date}", "{media_file}", "{subject}", "{behavior}","{modifiers}","{event_type}",{start},{stop},"{comment_start}","{comment_stop}");\n"""
-
-        else:
-            data = tablib.Dataset()
-            data.title = "Aggregated events"
-            header = ["Observation id", "Observation date", "Media file", "Total length", "FPS"]
-
-            # independent variables
-            if "independent_variables" in self.pj:
-                for idx in sorted_keys(self.pj["independent_variables"]):
-                    header.append(self.pj["independent_variables"][idx]["label"])
-
-            header.extend(["Subject", "Behavior"])
-
-            # check max number of modifiers
-            '''
-            eventsWithStatus = self.update_events_start_stop2(self.pj[OBSERVATIONS][obsId][EVENTS])
-            
-            max_modifiers = 0
-            for event in eventsWithStatus:
-                for c in pj_events_fields:
-                    if c == "modifier" and event[pj_obs_fields[c]]:
-                        max_modifiers = max(max_modifiers, len(event[pj_obs_fields[c]].split('|')))
-
-            
-            for x in range(1, max_modifiers + 1):
-                header.append("Modifier {}".format(x))
-            '''
-            
-            header.extend(["Modifiers"]) 
-            
-            header.extend(["Behavior type", "Start (s)", "Stop (s)", "Duration (s)", "Comment start", "Comment stop"])
-
-            data.append(header)
-
-        flagUnpairedEventFound = False
-
-        for obsId in selectedObservations:
-
-            duration1 = []   # in seconds
-            if self.pj[OBSERVATIONS][obsId]["type"] in [MEDIA]:
-                try:
-                    for mediaFile in self.pj[OBSERVATIONS][obsId][FILE][PLAYER1]:
-                        if "media_info" in self.pj[OBSERVATIONS][obsId]:
-                            duration1.append(self.pj[OBSERVATIONS][obsId]["media_info"]["length"][mediaFile])
-                        else:
-                            #if "media_file_info" in
-                            print("no media_info tag")
-                except:
-                    print("error")
-                    pass
-            
-
-            total_length = "{0:.3f}".format(self.observationTotalMediaLength(obsId))
-            logging.debug("media length for {0}: {1}".format(obsId, total_length))
-                
-            '''
-            if totalMediaLength in [0, -1]:
-                    selectedObsTotalMediaLength = -1
-                    break
-            '''
-
-            cursor = self.loadEventsInDB(plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
-
-            for subject in plot_parameters["selected subjects"]:
-
-                for behavior in plot_parameters["selected behaviors"]:
-
-                    cursor.execute("SELECT occurence, modifiers, comment FROM events WHERE observation = ? AND subject = ? AND code = ? ORDER by occurence", (obsId, subject, behavior))
-                    rows = list(cursor.fetchall())
-
-                    if STATE in self.eventType(behavior).upper() and len(rows) % 2:  # unpaired events
-                        flagUnpairedEventFound = True
-                        continue
-
-                    for idx, row in enumerate(rows):
-
-                        if self.pj[OBSERVATIONS][obsId]["type"] in [MEDIA]:
-
-                            mediaFileIdx = [idx1 for idx1, x in enumerate(duration1) if row["occurence"] >= sum(duration1[0:idx1])][-1]
-                            mediaFileString = self.pj[OBSERVATIONS][obsId][FILE][PLAYER1][mediaFileIdx]
-                            fpsString = self.pj[OBSERVATIONS][obsId]["media_info"]["fps"][self.pj[OBSERVATIONS][obsId][FILE][PLAYER1][mediaFileIdx]]
-
-                        if self.pj[OBSERVATIONS][obsId]["type"] in [LIVE]:
-                            mediaFileString = "LIVE"
-                            fpsString = "NA"
-
-                        if POINT in self.eventType(behavior).upper():
-
-                            if outputFormat == "sql":
-                                out += template.format(observation=obsId,
-                                                    date=self.pj[OBSERVATIONS][obsId]["date"].replace("T", " "),
-                                                    media_file=mediaFileString,
-                                                    total_length=total_length,
-                                                    fps=fpsString,
-                                                    subject=subject,
-                                                    behavior=behavior,
-                                                    modifiers=row["modifiers"].strip(),
-                                                    event_type=POINT,
-                                                    start="{0:.3f}".format(row["occurence"]),
-                                                    stop=0,
-                                                    comment_start=row["comment"],
-                                                    comment_stop="")
-                            else:
-                                row_data = []
-                                row_data.extend([obsId,
-                                            self.pj[OBSERVATIONS][obsId]["date"].replace("T", " "),
-                                            mediaFileString,
-                                            total_length,
-                                            fpsString])
-
-                                # independent variables
-                                if "independent_variables" in self.pj:
-                                    for idx_var in sorted_keys(self.pj["independent_variables"]):
-                                        if self.pj["independent_variables"][idx_var]["label"] in self.pj[OBSERVATIONS][obsId]["independent_variables"]:
-                                           row_data.append(self.pj[OBSERVATIONS][obsId]["independent_variables"][self.pj["independent_variables"][idx_var]["label"]])
-                                        else:
-                                            row_data.append("")
-
-                                row_data.extend([subject,
-                                            behavior,
-                                            row["modifiers"].strip(),
-                                            POINT,
-                                            "{0:.3f}".format(row["occurence"]), # start
-                                            "NA", # stop
-                                            "NA", # duration
-                                            row["comment"],
-                                            ""
-                                            ])
-                                data.append(row_data)
-
-
-                        if STATE in self.eventType(behavior).upper():
-                            if idx % 2 == 0:
-                                if outputFormat == "sql":
-                                    out += template.format(observation=obsId,
-                                                        date=self.pj[OBSERVATIONS][obsId]["date"].replace("T", " "),
-                                                        media_file=mediaFileString,
-                                                        total_length=total_length,
-                                                        fps=fpsString,
-                                                        subject=subject,
-                                                        behavior=behavior,
-                                                        modifiers=row["modifiers"].strip(),
-                                                        event_type=STATE,
-                                                        start="{0:.3f}".format(row["occurence"]),
-                                                        stop="{0:.3f}".format(rows[idx + 1]["occurence"]),
-                                                        comment_start=row["comment"],
-                                                        comment_stop=rows[idx + 1]["comment"])
-
-                                else:
-                                    row_data = []
-
-                                    row_data.extend([obsId,
-                                            self.pj[OBSERVATIONS][obsId]["date"].replace("T", " "),
-                                            mediaFileString,
-                                            total_length,
-                                            fpsString])
-
-                                    # independent variables
-                                    if "independent_variables" in self.pj:
-                                        for idx_var in sorted_keys(self.pj["independent_variables"]):
-                                            if self.pj["independent_variables"][idx_var]["label"] in self.pj[OBSERVATIONS][obsId]["independent_variables"]:
-                                               row_data.append(self.pj[OBSERVATIONS][obsId]["independent_variables"][self.pj["independent_variables"][idx_var]["label"]])
-                                            else:
-                                                row_data.append("")
-
-                                    row_data.extend([subject,
-                                            behavior,
-                                            row["modifiers"].strip(),
-                                            STATE,
-                                            "{0:.3f}".format(row["occurence"]),
-                                            "{0:.3f}".format(rows[idx + 1]["occurence"]),
-                                            "{0:.3f}".format(rows[idx + 1]["occurence"] - row["occurence"]),
-                                            row["comment"],
-                                            rows[idx + 1]["comment"]
-                                            ])
-
-                                    data.append(row_data)
-
-        if outputFormat == "sql":
-            out += "END TRANSACTION;\n"
+            _, _, conn = db_functions.load_aggregated_events_in_db(self.pj,
+                                                             plot_parameters["selected subjects"],
+                                                             selectedObservations,
+                                                             plot_parameters["selected behaviors"])
             try:
                 with open(fileName, "w") as f:
-                    f.write(out)
+                    for line in conn.iterdump():
+                        f.write("{}\n".format(line))
             except:
                 errorMsg = sys.exc_info()[1]
                 logging.critical(errorMsg)
                 QMessageBox.critical(None, programName, str(errorMsg), QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
+            return
 
-        elif outputFormat == "sds": # SDIS format
+        data_header = tablib.Dataset()
+        data_header.title = "Aggregated events"
+        header = ["Observation id", "Observation date", "Media file", "Total length", "FPS"]
+        if INDEPENDENT_VARIABLES in self.pj:
+            for idx in sorted_keys(self.pj[INDEPENDENT_VARIABLES]):
+                header.append(self.pj[INDEPENDENT_VARIABLES][idx]["label"])
+        header.extend(["Subject", "Behavior"])
+        header.extend(["Modifiers"]) 
+        header.extend(["Behavior type", "Start (s)", "Stop (s)", "Duration (s)", "Comment start", "Comment stop"])
+        data_header.append(header)
 
+        data = copy.deepcopy(data_header)
+        for obsId in selectedObservations:
+            d = export_observation.export_aggregated_events(self.pj, parameters, obsId)
+            data.extend(d)
+
+            if not flag_group:
+                fileName = str(pathlib.Path(pathlib.Path(exportDir) / safeFileName(obsId)).with_suffix("." + outputFormat))
+                r, msg = export_observation.dataset_write(data, fileName, outputFormat)
+                if not r:
+                    QMessageBox.warning(None, programName, msg, QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
+                data = copy.deepcopy(data_header)
+
+
+        if outputFormat == "sds": # SDIS format
             out = "% SDIS file created by BORIS (www.boris.unito.it) at {}\nTimed <seconds>;\n".format(datetime_iso8601())
-
             for obsId in selectedObservations:
                 # observation id
                 out += "\n<{}>\n".format(obsId)
-
                 dataList = list(data[1:])
                 for event in sorted(dataList, key=lambda x: x[-4]):  # sort events by start time
-
                     if event[0] == obsId:
-
                         behavior = event[-7]
                         # replace various char by _
                         for char in [" ", "-", "/"]:
                             behavior = behavior.replace(char, "_")
-
                         subject = event[-8]
                         # replace various char by _
                         for char in [" ", "-", "/"]:
                             subject = subject.replace(char, "_")
-
                         event_start = "{0:.3f}".format(round(event[-4], 3))  # start event (from end for independent variables)
-
                         if not event[-3]:  # stop event (from end)
                             event_stop = "{0:.3f}".format(round(event[-4] + 0.001, 3))
                         else:
                             event_stop = "{0:.3f}".format(round(event[-3], 3))
                         out += "{subject}_{behavior},{start}-{stop} ".format(subject=subject, behavior=behavior, start=event_start, stop=event_stop)
-
                 out += "/\n\n"
-
             with open(fileName, "wb") as f:
                 f.write(str.encode(out))
+            return
 
-        else:
-            if outputFormat == "tsv":
-                with open(fileName, "wb") as f:
-                    f.write(str.encode(data.tsv))
-            if outputFormat == "csv":
-                with open(fileName, "wb") as f:
-                    f.write(str.encode(data.csv))
-            if outputFormat == "html":
-                with open(fileName, "wb") as f:
-                    f.write(str.encode(data.html))
-            if outputFormat == "ods":
-                with open(fileName, "wb") as f:
-                    f.write(data.ods)
-            if outputFormat == "xlsx":
-                with open(fileName, "wb") as f:
-                    f.write(data.xlsx)
-            if outputFormat == "xls":
-                with open(fileName, "wb") as f:
-                    f.write(data.xls)
-
-
+        if flag_group:
+            r, msg = export_observation.dataset_write(data, fileName, outputFormat)
+            if not r:
+                QMessageBox.warning(None, programName, msg, QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
 
 
     def export_state_events_as_textgrid(self):
@@ -7887,12 +6641,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if not selectedObservations:
             return
 
-        plot_parameters = self.choose_obs_subj_behav_category(selectedObservations, maxTime=0, flagShowIncludeModifiers=False, flagShowExcludeBehaviorsWoEvents=False)
+        plot_parameters = self.choose_obs_subj_behav_category(selectedObservations, maxTime=0, flagShowIncludeModifiers=False,
+                                                              flagShowExcludeBehaviorsWoEvents=False)
 
         if not plot_parameters["selected subjects"] or not plot_parameters["selected behaviors"]:
             return
 
-        exportDir = QFileDialog(self).getExistingDirectory(self, "Export events as TextGrid", os.path.expanduser('~'), options=QFileDialog(self).ShowDirsOnly)
+        exportDir = QFileDialog(self).getExistingDirectory(self, "Export events as TextGrid", os.path.expanduser('~'),
+                                                           options=QFileDialog(self).ShowDirsOnly)
         if not exportDir:
             return
 
@@ -7922,8 +6678,11 @@ item []:
 """
 
             flagUnpairedEventFound = False
-            totalMediaDuration = round(self.observationTotalMediaLength(obsId), 3)
-            cursor = self.loadEventsInDB(plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
+            '''TO BE REMOVED  totalMediaDuration = round(self.observationTotalMediaLength(obsId), 3)'''
+            totalMediaDuration = round(project_functions.observation_total_length(self.pj[OBSERVATIONS][obsId]), 3)
+
+            cursor = db_functions.load_events_in_db(self.pj, plot_parameters["selected subjects"], selectedObservations, plot_parameters["selected behaviors"])
+
             cursor.execute("SELECT count(distinct subject) FROM events WHERE observation = '{}' AND subject in ('{}') AND type = 'STATE' ".format(obsId, "','".join(plot_parameters["selected subjects"])))
             subjectsNum = int(list(cursor.fetchall())[0][0])
 
@@ -7990,13 +6749,13 @@ item []:
                                 logging.debug("difference after: {} - {} = {}".format(rows[idx + 2]["occurence"], rows[idx + 1]["occurence"], rows[idx + 2]["occurence"] - rows[idx + 1]["occurence"]))
 
                 # check if last event ends at the end of media file
-                if rows[-1]["occurence"] < self.observationTotalMediaLength(obsId):
+                '''TO BE REMOVED  if rows[-1]["occurence"] < self.observationTotalMediaLength(obsId):'''
+                if rows[-1]["occurence"] < project_functions.observation_total_length(self.pj[OBSERVATIONS][obsId]):
                     count += 1
                     out += template.format(count=count, name="null", xmin=rows[-1]["occurence"], xmax=totalMediaDuration)
 
                 # add info
                 out = out.format(subjectIdx=subjectIdx, subject=subject, intervalsSize=count, intervalsMin=intervalsMin, intervalsMax=intervalsMax)
-
 
             try:
                 with open("{exportDir}{sep}{obsId}.textGrid".format(exportDir=exportDir, sep=os.sep, obsId=obsId), "w") as f:
@@ -8012,7 +6771,6 @@ item []:
                 errorMsg = sys.exc_info()[1]
                 logging.critical(errorMsg)
                 QMessageBox.critical(None, programName, str(errorMsg), QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-
 
 
     def media_file_info(self):
@@ -8072,7 +6830,6 @@ item []:
                                                      )
 
             self.results = dialog.ResultsWidget()
-            self.results.resize(540, 640)
             self.results.setWindowTitle(programName + " - Media file information")
             self.results.ptText.setReadOnly(True)
 
@@ -8080,17 +6837,19 @@ item []:
 
             # FFmpeg analysis
             self.results.ptText.appendHtml("<br><b>FFmpeg analysis</b><hr>")
-            for idx in self.pj[OBSERVATIONS][self.observationId][FILE]:
-                for filePath in self.pj[OBSERVATIONS][self.observationId][FILE][idx]:
-                    nframes, duration_ms, duration, fps, hasVideo, hasAudio = accurate_media_analysis(self.ffmpeg_bin, filePath)
+            for nplayer in self.pj[OBSERVATIONS][self.observationId][FILE]:
+                for filePath in self.pj[OBSERVATIONS][self.observationId][FILE][nplayer]:
+                    media_full_path = project_functions.media_full_path(filePath, self.projectFileName)
+                    nframes, duration_ms, duration, fps, hasVideo, hasAudio = accurate_media_analysis(self.ffmpeg_bin, media_full_path)
                     if nframes == -1:
-                        self.results.ptText.appendHtml("File path: {filePath}<br><br>{error}<br><br>".format(filePath=filePath, error=duration_ms))
+                        self.results.ptText.appendHtml("File path: {filePath}<br><br>{error}<br><br>".format(filePath=media_full_path,
+                                                                                                             error=duration_ms))
                     else:
                         self.results.ptText.appendHtml("File path: {}<br>Duration: {}<br>FPS: {}<br>Has video: {}<br>Has audio: {}<br><br>".
-                            format(filePath, self.convertTime(duration), fps, hasVideo, hasAudio))
+                            format(media_full_path, self.convertTime(duration), fps, hasVideo, hasAudio))
 
             self.results.ptText.appendHtml("Total duration: {} (hh:mm:ss.sss)".
-                format(self.convertTime(sum(self.duration)/1000)))
+                format(self.convertTime(sum(self.duration) / 1000)))
 
             self.results.show()
 
@@ -8101,7 +6860,6 @@ item []:
 
             if filePath:
                 self.results = dialog.ResultsWidget()
-                self.results.resize(540, 640)
                 self.results.setWindowTitle(programName + " - Media file information")
                 self.results.ptText.setReadOnly(True)
                 self.results.ptText.appendHtml("<br><b>FFmpeg analysis</b><hr>")
@@ -8112,6 +6870,7 @@ item []:
                     self.results.ptText.appendHtml("File path: {}<br>Duration: {}<br>FPS: {}<br>Has video: {}<br>Has audio: {}<br><br>".
                         format(filePath, self.convertTime(duration), fps, hasVideo, hasAudio))
                 self.results.show()
+
 
     def switch_playing_mode(self):
         """
@@ -8276,8 +7035,10 @@ item []:
 
                     for idx, media in enumerate(self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER1]):
                         if self.FFmpegGlobalFrame < sum(self.duration[0:idx + 1]):
-                            dirName, fileName = os.path.split(media)
-                            snapshotFilePath = dirName + os.sep + os.path.splitext(fileName)[0] + "_" + str(self.FFmpegGlobalFrame) + ".png"
+
+                            p = pathlib.Path(media)
+                            snapshotFilePath = str(p.parent / "{}_{}.png".format(p.stem, self.FFmpegGlobalFrame))
+
                             if self.detachFrameViewer or self.second_player():
                                 self.frame_viewer1.lbFrame.pixmap().save(snapshotFilePath)
                             elif not self.detachFrameViewer:
@@ -8288,8 +7049,10 @@ item []:
                     if self.second_player():
                         for idx, media in enumerate(self.pj[OBSERVATIONS][self.observationId][FILE][PLAYER2]):
                             if self.FFmpegGlobalFrame2 < sum(self.duration2[0:idx + 1]):
-                                dirName, fileName = os.path.split(media)
-                                snapshotFilePath = dirName + os.sep + os.path.splitext(fileName)[0] + "_" + str(self.FFmpegGlobalFrame2) + ".png"
+
+                                p = pathlib.Path(media)
+                                snapshotFilePath = str(p.parent / "{}_{}.png".format(p.stem, self.FFmpegGlobalFrame2))
+
                                 self.frame_viewer2.lbFrame.pixmap().save(snapshotFilePath)
                                 self.statusbar.showMessage("Snapshot player #2 saved in {}".format(snapshotFilePath), 0)
                                 break
@@ -8297,6 +7060,7 @@ item []:
                 else:  # VLC
 
                     current_media_path = url2path(self.mediaplayer.get_media().get_mrl())
+                    # TODO: replace with pathlib
                     dirName, fileName = os.path.split(current_media_path)
                     self.mediaplayer.video_take_snapshot(0, "{dirName}{sep}{fileNameWOExt}_{time}.png".format(
                                                               dirName=dirName,
@@ -8352,8 +7116,6 @@ item []:
             pass
 
 
-
-
     def video_normalspeed_activated(self):
         """
         set playing speed at normal speed
@@ -8387,6 +7149,7 @@ item []:
 
             logging.info('play rate: {:.3f}'.format(self.play_rate))
 
+
     def video_slower_activated(self):
         """
         decrease playing speed by play_rate_step value
@@ -8407,8 +7170,6 @@ item []:
             logging.info('play rate: {:.3f}'.format(self.play_rate))
 
 
-
-
     def add_event(self):
         """
         manually add event to observation
@@ -8417,6 +7178,19 @@ item []:
         if not self.observationId:
             self.no_observation()
             return
+
+        if self.pause_before_addevent:
+            # pause media
+            if self.pj[OBSERVATIONS][self.observationId][TYPE] in [MEDIA]:
+                if self.playerType == VLC:
+                    if self.playMode == FFMPEG:
+                        memState = self.FFmpegTimer.isActive()
+                        if memState:
+                            self.pause_video()
+                    else:
+                        memState = self.mediaListPlayer.get_state()
+                        if memState == vlc.State.Playing:
+                            self.pause_video()
 
         laps = self.getLaps()
 
@@ -8470,6 +7244,17 @@ item []:
 
                     self.writeEvent(event, newTime)
                     break
+
+        if self.pause_before_addevent:
+            # restart media
+            if self.pj[OBSERVATIONS][self.observationId][TYPE] in [MEDIA]:
+                if self.playerType == VLC:
+                    if self.playMode == FFMPEG:
+                        if memState:
+                            self.play_video()
+                    else:
+                        if memState == vlc.State.Playing:
+                            self.play_video()
 
 
     def run_event_outside(self):
@@ -8656,14 +7441,18 @@ item []:
         else:
             QMessageBox.warning(self, programName, "Select an event to edit")
 
+
     def no_media(self):
         QMessageBox.warning(self, programName, "There is no media available")
+
 
     def no_project(self):
         QMessageBox.warning(self, programName, "There is no project")
 
+
     def no_observation(self):
         QMessageBox.warning(self, programName, "There is no current observation")
+
 
     def twEthogram_doubleClicked(self):
         """
@@ -8677,6 +7466,7 @@ item []:
                 self.writeEvent(event, self.getLaps())
         else:
             self.no_observation()
+
 
     def actionUser_guide_triggered(self):
         """
@@ -8697,11 +7487,6 @@ item []:
         handle click signal from BehaviorsCodingMapWindowClass widget
         """
 
-        #sendEventSignal = pyqtSignal(QEvent)
-        print("sender", self.sender())
-        print("bcm_name", bcm_name )
-        print("behavior_codes_list", bcm_name, behavior_codes_list)
-        
         for code in behavior_codes_list:
             try:
                 behavior_idx = [key for key in  self.pj[ETHOGRAM] if self.pj[ETHOGRAM][key]["code"] == code][0]
@@ -8722,7 +7507,6 @@ item []:
 
     def close_behaviors_coding_map(self, coding_map_name):
         
-        print("signal close received ",coding_map_name)
         del self.bcm_dict[coding_map_name]
         
         if hasattr(self, "bcm"):
@@ -8736,7 +7520,7 @@ item []:
             self.bcm.deleteLater()
             #del self.bcm
             '''
-            
+            """TO DO: fix this"""
             print('hasattr(self, "bcm")', hasattr(self, "bcm"))
 
 
@@ -8763,7 +7547,8 @@ item []:
             self.bcm_dict[coding_map_name].show()
         else:
             self.bcm_dict[coding_map_name] = behaviors_coding_map.BehaviorsCodingMapWindowClass(
-                                                   self.pj[BEHAVIORS_CODING_MAP][items.index(coding_map_name)], idx=items.index(coding_map_name))
+                                                        self.pj[BEHAVIORS_CODING_MAP][items.index(coding_map_name)],
+                                                        idx=items.index(coding_map_name))
 
             self.bcm_dict[coding_map_name].clickSignal.connect(self.click_signal_from_behaviors_coding_map)
 
@@ -8774,10 +7559,9 @@ item []:
             self.bcm_dict[coding_map_name].show()
 
 
-
     def actionAbout_activated(self):
         """
-        about dialog
+        About dialog
         """
 
         ver = 'v. {0}'.format(__version__)
@@ -8795,7 +7579,7 @@ item []:
         else:
             ffmpeg_true_path = self.ffmpeg_bin
         players.append("Path: {}".format(ffmpeg_true_path))
-        
+
         # matplotlib
         players.append("\nMatplotlib")
         players.append("version {}".format(matplotlib.__version__))
@@ -8814,7 +7598,7 @@ item []:
         about_dialog.setEscapeButton(QMessageBox.Ok)
 
         about_dialog.setInformativeText(("<b>{prog_name}</b> {ver} - {date}"
-        "<p>Copyright &copy; 2012-2017 Olivier Friard - Marco Gamba<br>"
+        "<p>Copyright &copy; 2012-2018 Olivier Friard - Marco Gamba<br>"
         "Department of Life Sciences and Systems Biology<br>"
         "University of Torino - Italy<br>"
         "<br>"
@@ -8846,6 +7630,7 @@ item []:
 
         _ = about_dialog.exec_()
 
+
     def hsVideo_sliderMoved(self):
         """
         media position slider moved
@@ -8865,6 +7650,7 @@ item []:
                                    - self.pj[OBSERVATIONS][self.observationId][TIME_OFFSET_SECOND_PLAYER] * 1000))
                 self.timer_out(scrollSlider=False)
                 self.timer_spectro_out()
+
 
     def get_events_current_row(self):
         """
@@ -8897,7 +7683,14 @@ item []:
     def get_current_states_by_subject(self, stateBehaviorsCodes, events, subjects, time):
         """
         get current states for subjects at given time
+        Args:
+            stateBehaviorsCodes (list): list of behavior codes defined as STATE event
+            events (list): list of events
+            subjects (list): list of subjects
+            time (Decimal): time
 
+        Returns:
+            dict: current states by subject. dict of list
         """
         currentStates = {}
         for idx in subjects:
@@ -8916,7 +7709,7 @@ item []:
             for j in range(self.twSubjects.rowCount()):
                 if self.twSubjects.item(j, 1).text() == self.pj[SUBJECTS][idx]["name"]:
                     self.twSubjects.item(j, len(subjectsFields)).setText(",".join(self.currentStates[idx]))
-        
+
 
     def timer_out(self, scrollSlider=True):
         """
@@ -8996,6 +7789,8 @@ item []:
             if self.mediaplayer.get_length():
 
                 self.mediaTotalLength = self.mediaplayer.get_length() / 1000
+                
+                '''
                 if abs(self.mediaTotalLength - totalGlobalTime / 1000) > 10:
                     self.timer.stop()
                     #self.pause_video()
@@ -9009,23 +7804,27 @@ item []:
                                                                         format(self.convertTime(self.mediaTotalLength),
                                                                                self.convertTime(totalGlobalTime/1000)), [OK])
 
-                    '''
+                    """
                     if response == "Close observation":
                         try:
                             self.close_observation()
                             return False
                         except:
                             pass
-                    '''
+                    """
+                '''
                 # current state(s)
                 # extract State events
-                StateBehaviorsCodes = [self.pj[ETHOGRAM][x]["code"] for x in [y for y in self.pj[ETHOGRAM] if STATE in self.pj[ETHOGRAM][y][TYPE].upper()]]
+                StateBehaviorsCodes = state_behavior_codes(self.pj[ETHOGRAM])
 
                 self.currentStates = {}
 
                 # add current states for all subject and for "no focal subject"
 
-                self.currentStates = self.get_current_states_by_subject(StateBehaviorsCodes, self.pj[OBSERVATIONS][self.observationId][EVENTS], dict(self.pj[SUBJECTS], **{"": {"name": ""}}), currentTimeOffset)
+                self.currentStates = self.get_current_states_by_subject(StateBehaviorsCodes,
+                                                                        self.pj[OBSERVATIONS][self.observationId][EVENTS],
+                                                                        dict(self.pj[SUBJECTS], **{"": {"name": ""}}),
+                                                                        currentTimeOffset)
 
                 # show current subject
                 cm = {}
@@ -9070,8 +7869,9 @@ item []:
                         msg += " (paused)"
 
                 if msg:
-                    # show time on status bar
+                    # show time
                     self.lbTime.setText(msg)
+                    self.lb_current_media_time.setText(msg)
 
                     # set video scroll bar
                     if scrollSlider:
@@ -9081,37 +7881,41 @@ item []:
 
             if (self.memMedia and mediaName != self.memMedia) or (self.mediaListPlayer.get_state() == vlc.State.Ended and self.timer.isActive()):
 
-                if CLOSE_BEHAVIORS_BETWEEN_VIDEOS in self.pj[OBSERVATIONS][self.observationId] and self.pj[OBSERVATIONS][self.observationId][CLOSE_BEHAVIORS_BETWEEN_VIDEOS]:
+                if (CLOSE_BEHAVIORS_BETWEEN_VIDEOS in self.pj[OBSERVATIONS][self.observationId] 
+                    and self.pj[OBSERVATIONS][self.observationId][CLOSE_BEHAVIORS_BETWEEN_VIDEOS]):
 
                     logging.debug("video changed")
                     logging.debug("current states: {}".format(self.currentStates))
 
                     for subjIdx in self.currentStates:
-
                         if subjIdx:
                             subjName = self.pj[SUBJECTS][subjIdx]["name"]
                         else:
                             subjName = ""
-
                         for behav in self.currentStates[subjIdx]:
-
                             cm = ""
                             for ev in self.pj[OBSERVATIONS][self.observationId][EVENTS]:
                                 if ev[EVENT_TIME_FIELD_IDX] > currentTime / 1000:  # time
                                     break
-
                                 if ev[EVENT_SUBJECT_FIELD_IDX] == subjName:  # current subject name
                                     if ev[EVENT_BEHAVIOR_FIELD_IDX] == behav:   # code
                                         cm = ev[EVENT_MODIFIER_FIELD_IDX]
 
-                            event = {"subject": subjName, "code": behav, "modifiers": cm, "comment": "", "excluded": ""}
+                            '''event = {"subject": subjName, "code": behav, "modifiers": cm, "comment": "", "excluded": ""}'''
 
-                            self.writeEvent(event, currentTime / 1000 - Decimal("0.001"))
+                            end_time = currentTime / 1000 - Decimal("0.001")
+
+                            self.pj[OBSERVATIONS][self.observationId][EVENTS].append([end_time, subjName, behav, cm, ""])
+                            self.loadEventsInTW(self.observationId)
+                            item = self.twEvents.item([i for i, t in enumerate(self.pj[OBSERVATIONS][self.observationId][EVENTS]) if t[0] == end_time][0], 0)
+                            self.twEvents.scrollToItem(item)
+                            self.projectChanged = True
 
             self.memMedia = mediaName
 
             if self.mediaListPlayer.get_state() == vlc.State.Ended:
                 self.timer.stop()
+
 
     def load_behaviors_in_twEthogram(self, behaviorsToShow):
         """
@@ -9123,7 +7927,6 @@ item []:
             for idx in sorted_keys(self.pj[ETHOGRAM]):
                 if self.pj[ETHOGRAM][idx]["code"] in behaviorsToShow:
                     self.twEthogram.setRowCount(self.twEthogram.rowCount() + 1)
-                    #for col, field in enumerate(["key", "code", "type", "description", "modifiers", "excluded"]):
                     for col in sorted(behav_fields_in_mainwindow.keys()):
                         field = behav_fields_in_mainwindow[col]
                         self.twEthogram.setItem(self.twEthogram.rowCount() - 1, col, QTableWidgetItem(str(self.pj[ETHOGRAM][idx][field])))
@@ -9135,9 +7938,13 @@ item []:
         else:
             self.dwEthogram.setWindowTitle("Ethogram")
 
+
     def load_subjects_in_twSubjects(self, subjects_to_show):
         """
         fill subjects table widget with subjects from subjects_to_show
+        
+        Args:
+            subjects_to_show (list): list of subject to be shown
         """
 
         self.twSubjects.setRowCount(0)
@@ -9190,33 +7997,6 @@ item []:
                 else:
                     self.twEvents.item(row, tw_obs_fields[TYPE]).setText(START)
 
-    def update_events_start_stop2(self, events):
-        """
-        returns events with status (START/STOP or POINT)
-        take consideration of subject
-        """
-
-        stateEventsList = [self.pj[ETHOGRAM][x][BEHAVIOR_CODE] for x in self.pj[ETHOGRAM] if STATE in self.pj[ETHOGRAM][x][TYPE].upper()]
-        eventsFlagged = []
-        for event in events:
-            time, subject, code, modifier = event[EVENT_TIME_FIELD_IDX], event[EVENT_SUBJECT_FIELD_IDX], event[EVENT_BEHAVIOR_FIELD_IDX], event[EVENT_MODIFIER_FIELD_IDX]
-            # check if code is state
-            if code in stateEventsList:
-                # how many code before with same subject?
-                if len([x[EVENT_BEHAVIOR_FIELD_IDX] for x in events
-                                                     if x[EVENT_BEHAVIOR_FIELD_IDX] == code
-                                                        and x[EVENT_TIME_FIELD_IDX] < time
-                                                        and x[EVENT_SUBJECT_FIELD_IDX] == subject
-                                                        and x[EVENT_MODIFIER_FIELD_IDX] == modifier]) % 2: # test if odd
-                    flag = STOP
-                else:
-                    flag = START
-            else:
-                flag = POINT
-
-            eventsFlagged.append(event + [flag])
-
-        return eventsFlagged
 
     def checkSameEvent(self, obsId, time, subject, code):
         """
@@ -9225,6 +8005,7 @@ item []:
         return [time, subject, code] in [[x[EVENT_TIME_FIELD_IDX], x[EVENT_SUBJECT_FIELD_IDX], x[EVENT_BEHAVIOR_FIELD_IDX]]
                                             for x in self.pj[OBSERVATIONS][obsId][EVENTS]]
 
+
     def writeEvent(self, event, memTime):
         """
         add event from pressed key to observation
@@ -9232,143 +8013,139 @@ item []:
         ask for modifiers if configured
         load events in tableview
         scroll to active event
+
+        Args:
+            event (dict): event parameters
+            memTime (Decimal): time 
+        
         """
 
         logging.debug("write event - event: {0}  memtime: {1}".format(event, memTime))
-
-        if event is None:
-            return
-
-        # add time offset if not from editing
-        if "row" not in event:
-            memTime += Decimal(self.pj[OBSERVATIONS][self.observationId][TIME_OFFSET]).quantize(Decimal(".001"))
-
-        # check if a same event is already in events list (time, subject, code)
-        # "row" present in case of event editing
-
-        if "row" not in event and self.checkSameEvent(self.observationId, memTime, self.currentSubject, event["code"]):
-            _ = dialog.MessageDialog(programName, "The same event already exists (same time, behavior code and subject).", [OK])
-            return
-
-        if not "from map" in event:   # modifiers only for behaviors without coding map
-            # check if event has modifiers
-            modifier_str = ""
-
-            if event["modifiers"]:
-
-                # pause media
-                if self.pj[OBSERVATIONS][self.observationId][TYPE] in [MEDIA]:
-
-                    if self.playerType == VLC:
-                        if self.playMode == FFMPEG:
-                            memState = self.FFmpegTimer.isActive()
-                            if memState:
-                                self.pause_video()
-                        else:
-                            memState = self.mediaListPlayer.get_state()
-                            if memState == vlc.State.Playing:
-                                self.pause_video()
-
-                # check if editing (original_modifiers key)
-                currentModifiers = event["original_modifiers"] if "original_modifiers" in event else ""
-
-                modifierSelector = select_modifiers.ModifiersList(event["code"], eval(str(event["modifiers"])), currentModifiers)
-
-                if modifierSelector.exec_():
-                    selected_modifiers = modifierSelector.getModifiers()
-                    
-                    modifier_str = ""
-                    for idx in sorted_keys(selected_modifiers):
-                        if modifier_str:
-                            modifier_str += "|"
-                        if selected_modifiers[idx]["type"] in [SINGLE_SELECTION, MULTI_SELECTION]:
-                            modifier_str += ",".join(selected_modifiers[idx]["selected"])
-                        if selected_modifiers[idx]["type"] in [NUMERIC_MODIFIER]:
-                            modifier_str += selected_modifiers[idx]["selected"]
-                else:
-                    modifier_str = currentModifiers
-                    
-                # restart media
-                if self.pj[OBSERVATIONS][self.observationId][TYPE] in [MEDIA]:
-
-                    if self.playerType == VLC:
-                        if self.playMode == FFMPEG:
-                            if memState:
-                                self.play_video()
-                        else:
-                            if memState == vlc.State.Playing:
-                                self.play_video()
-
-        else:
-            modifier_str = event["from map"]
-
-        # update current state
-        if "row" not in event: # no editing
-            if self.currentSubject:
-                csj = []
-                for idx in self.currentStates:
-                    if idx in self.pj[SUBJECTS] and self.pj[SUBJECTS][idx]["name"] == self.currentSubject:
-                        csj = self.currentStates[idx]
-                        break
-
-            else:  # no focal subject
-                try:
-                    csj = self.currentStates[""]
-                except:
+        try:
+            if event is None:
+                return
+    
+            # add time offset if not from editing
+            if "row" not in event:
+                memTime += Decimal(self.pj[OBSERVATIONS][self.observationId][TIME_OFFSET]).quantize(Decimal(".001"))
+    
+            # check if a same event is already in events list (time, subject, code)
+            # "row" present in case of event editing
+    
+            if "row" not in event and self.checkSameEvent(self.observationId, memTime, self.currentSubject, event["code"]):
+                _ = dialog.MessageDialog(programName, "The same event already exists (same time, behavior code and subject).", [OK])
+                return
+    
+            if not "from map" in event:   # modifiers only for behaviors without coding map
+                # check if event has modifiers
+                modifier_str = ""
+    
+                if event["modifiers"]:
+                    # pause media
+                    if self.pj[OBSERVATIONS][self.observationId][TYPE] in [MEDIA]:
+                        if self.playerType == VLC:
+                            if self.playMode == FFMPEG:
+                                memState = self.FFmpegTimer.isActive()
+                                if memState:
+                                    self.pause_video()
+                            else:
+                                memState = self.mediaListPlayer.get_state()
+                                if memState == vlc.State.Playing:
+                                    self.pause_video()
+    
+                    # check if editing (original_modifiers key)
+                    currentModifiers = event["original_modifiers"] if "original_modifiers" in event else ""
+    
+                    modifierSelector = select_modifiers.ModifiersList(event["code"], eval(str(event["modifiers"])), currentModifiers)
+    
+                    if modifierSelector.exec_():
+                        selected_modifiers = modifierSelector.getModifiers()
+    
+                        modifier_str = ""
+                        for idx in sorted_keys(selected_modifiers):
+                            if modifier_str:
+                                modifier_str += "|"
+                            if selected_modifiers[idx]["type"] in [SINGLE_SELECTION, MULTI_SELECTION]:
+                                modifier_str += ",".join(selected_modifiers[idx]["selected"])
+                            if selected_modifiers[idx]["type"] in [NUMERIC_MODIFIER]:
+                                modifier_str += selected_modifiers[idx]["selected"]
+                    else:
+                        modifier_str = currentModifiers
+    
+                    # restart media
+                    if self.pj[OBSERVATIONS][self.observationId][TYPE] in [MEDIA]:
+                        if self.playerType == VLC:
+                            if self.playMode == FFMPEG:
+                                if memState:
+                                    self.play_video()
+                            else:
+                                if memState == vlc.State.Playing:
+                                    self.play_video()
+    
+            else:
+                modifier_str = event["from map"]
+    
+            # update current state
+            if "row" not in event: # no editing
+                if self.currentSubject:
                     csj = []
+                    for idx in self.currentStates:
+                        if idx in self.pj[SUBJECTS] and self.pj[SUBJECTS][idx]["name"] == self.currentSubject:
+                            csj = self.currentStates[idx]
+                            break
+    
+                else:  # no focal subject
+                    try:
+                        csj = self.currentStates[""]
+                    except:
+                        csj = []
+    
+                cm = {} # modifiers for current behaviors
+                for cs in csj:
+                    for ev in self.pj[OBSERVATIONS][self.observationId][EVENTS]:
+                        if ev[EVENT_TIME_FIELD_IDX] > memTime:
+                            break
+    
+                        if ev[EVENT_SUBJECT_FIELD_IDX] == self.currentSubject:
+                            if ev[EVENT_BEHAVIOR_FIELD_IDX] == cs:
+                                cm[cs] = ev[EVENT_MODIFIER_FIELD_IDX]
 
-            cm = {} # modifiers for current behaviors
-            for cs in csj:
-                for ev in self.pj[OBSERVATIONS][self.observationId][EVENTS]:
-                    if ev[EVENT_TIME_FIELD_IDX] > memTime:
-                        break
+                for cs in csj:
+                    # close state if same state without modifier
+                    if self.close_the_same_current_event and (event["code"] == cs) and modifier_str.replace("None", "").replace("|", "") == "":
+                        modifier_str = cm[cs]
+                        continue
+    
+                    if (event["excluded"] and cs in event["excluded"].split(",")) or (event["code"] == cs and cm[cs] != modifier_str):
+                        # add excluded state event to observations (= STOP them)
+                        self.pj[OBSERVATIONS][self.observationId][EVENTS].append([memTime - Decimal("0.001"), self.currentSubject, cs, cm[cs], ""])
 
-                    if ev[EVENT_SUBJECT_FIELD_IDX] == self.currentSubject:
-                        if ev[EVENT_BEHAVIOR_FIELD_IDX] == cs:
-                            cm[cs] = ev[EVENT_MODIFIER_FIELD_IDX]
+            # remove key code from modifiers
+            modifier_str = re.sub(" \(.*\)", "", modifier_str)
+    
+            comment = event["comment"] if "comment" in event else ""
+            subject = event["subject"] if "subject" in event else ""
+    
+            # add event to pj
+            if "row" in event:
+                # modifying event
+                self.pj[OBSERVATIONS][self.observationId][EVENTS][event["row"]] = [memTime, subject, event["code"], modifier_str, comment]
+            else:
+                # add event
+                self.pj[OBSERVATIONS][self.observationId][EVENTS].append([memTime, subject, event["code"], modifier_str, comment])
+    
+            # sort events in pj
+            self.pj[OBSERVATIONS][self.observationId][EVENTS].sort()
+    
+            # reload all events in tw
+            self.loadEventsInTW(self.observationId)
+            item = self.twEvents.item([i for i, t in enumerate(self.pj[OBSERVATIONS][self.observationId][EVENTS]) if t[0] == memTime][0], 0)
+            self.twEvents.scrollToItem(item)
+            self.projectChanged = True
+        except:
+            dialog.MessageDialog(programName, "Even can not be recorded.\nError: {}".format(sys.exc_info()[1]) , [OK])
+            
 
-            for cs in csj:
-
-                # close state if same state without modifier
-                if self.close_the_same_current_event and (event["code"] == cs) and modifier_str.replace("None", "").replace("|", "") == "":
-                    modifier_str = cm[cs]
-                    continue
-
-                if (event["excluded"] and cs in event["excluded"].split(",")) or (event["code"] == cs and cm[cs] != modifier_str):
-                    # add excluded state event to observations (= STOP them)
-                    self.pj[OBSERVATIONS][self.observationId][EVENTS].append([memTime - Decimal("0.001"), self.currentSubject, cs, cm[cs], ""])
-
-
-        # remove key code from modifiers
-        modifier_str = re.sub(" \(.*\)", "", modifier_str)
-
-        if "comment" in event:
-            comment = event["comment"]
-        else:
-            comment = ""
-
-        if "subject" in event:
-            subject = event["subject"]
-        else:
-            subject = self.currentSubject
-
-        # add event to pj
-        if "row" in event:
-            self.pj[OBSERVATIONS][self.observationId][EVENTS][event["row"]] = [memTime, subject, event["code"], modifier_str, comment]
-        else:
-            self.pj[OBSERVATIONS][self.observationId][EVENTS].append([memTime, subject, event["code"], modifier_str, comment])
-
-        # sort events in pj
-        self.pj[OBSERVATIONS][self.observationId][EVENTS].sort()
-
-        # reload all events in tw
-        self.loadEventsInTW(self.observationId)
-
-        item = self.twEvents.item([i for i, t in enumerate(self.pj[OBSERVATIONS][self.observationId][EVENTS]) if t[0] == memTime][0], 0)
-
-        self.twEvents.scrollToItem(item)
-
-        self.projectChanged = True
 
     def fill_lwDetailed(self, obs_key, memLaps):
         """
@@ -9397,11 +8174,16 @@ item []:
             else:
                 return None
 
+
     def getLaps(self):
-        """
-        return cumulative laps time from begining of observation
-        as Decimal in seconds
+        """Cumulative laps time from begining of observation
         no more add time offset!
+
+        Args:
+        
+        Returns:
+            decimal: cumulative time in seconds
+
         """
 
         if self.pj[OBSERVATIONS][self.observationId]["type"] in [LIVE]:
@@ -9420,21 +8202,16 @@ item []:
                 return Decimal(0)
 
             if self.playerType == VLC:
-
                 if self.playMode == FFMPEG:
                     # cumulative time
-
                     memLaps = Decimal(self.FFmpegGlobalFrame * (1000 / list(self.fps.values())[0]) / 1000).quantize(Decimal(".001"))
-
                     return memLaps
-
                 else: # playMode == VLC
-
                     # cumulative time
                     memLaps = Decimal(str(round((sum(self.duration[0: self.media_list.index_of_item(self.mediaplayer.get_media())]) +
                               self.mediaplayer.get_time()) / 1000, 3)))
-
                     return memLaps
+
 
     def full_event(self, behavior_idx):
         """
@@ -9476,6 +8253,7 @@ item []:
 
         return event
 
+
     def frame_backward(self):
         """
         go one frame back
@@ -9488,6 +8266,7 @@ item []:
                 self.ffmpegTimerOut()
                 logging.debug("new frame {0}".format(self.FFmpegGlobalFrame))
 
+
     def frame_forward(self):
         """
         go one frame forward
@@ -9495,12 +8274,14 @@ item []:
         if self.playMode == FFMPEG:
             self.ffmpegTimerOut()
 
+
     def beep(self, parameters):
         """
         emit beep on various platform
         """
         if sys.platform.startswith("linux"):
-            os.system("beep {}".format(parameters))
+            #os.system("beep {}".format(parameters))
+            app.beep()
         else:
             app.beep()
 
@@ -9548,7 +8329,8 @@ item []:
             return
 
         if self.playerType == VIEWER:
-            QMessageBox.critical(self, programName, "The current observation is opened in VIEW mode.\nIt is not allowed to log events in this mode.")
+            QMessageBox.critical(self, programName, ("The current observation is opened in VIEW mode.\n"
+                                                     "It is not allowed to log events in this mode."))
             return
 
         if ek == Qt.Key_Escape:
@@ -9617,7 +8399,6 @@ item []:
                 obs_key = function_keys[ek]
 
         # get video time
-
         if (self.pj[OBSERVATIONS][self.observationId][TYPE] in [LIVE]
            and "scan_sampling_time" in self.pj[OBSERVATIONS][self.observationId]
            and self.pj[OBSERVATIONS][self.observationId]["scan_sampling_time"]):
@@ -9648,7 +8429,6 @@ item []:
                 ek_unichr = ""
 
                 if "#subject#" in event.text():
-                    print("event.text()", event.text(), event.text().replace("#subject#", ""))
                     for idx in self.pj[SUBJECTS]:
                         if self.pj[SUBJECTS][idx]["name"] == event.text().replace("#subject#", ""):
                             subj_idx = idx
@@ -9755,6 +8535,7 @@ item []:
                 if not flag_subject:
                     self.statusbar.showMessage("Key not assigned ({})".format(ek_unichr), 5000)
 
+
     def twEvents_doubleClicked(self):
         """
         seek video to double clicked position (add self.repositioningTimeOffset value)
@@ -9765,7 +8546,7 @@ item []:
 
             row = self.twEvents.selectedIndexes()[0].row()
 
-            if ':' in self.twEvents.item(row, 0).text():
+            if ":" in self.twEvents.item(row, 0).text():
                 time_ = time2seconds(self.twEvents.item(row, 0).text())
             else:
                 time_  = Decimal(self.twEvents.item(row, 0).text())
@@ -9778,15 +8559,47 @@ item []:
             else:
                 newTime = 0
 
-
             if self.playMode == VLC:
+                
+                print("new time", newTime)
+                
+                flag_pause = (self.mediaListPlayer.get_state() in [vlc.State.Paused]
+                              or self.mediaListPlayer2.get_state() in [vlc.State.Paused])
 
                 if len(self.duration) == 1:
+                    '''print(self.mediaplayer.get_media().get_duration())'''
+                    if self.mediaListPlayer.get_state() == vlc.State.Ended and time_ < self.mediaplayer.get_media().get_duration() / 1000:
+                        #self.play_video()
+                        
+                        self.mediaListPlayer.play()
+                        while True:
+                            if self.mediaListPlayer.get_state() in [vlc.State.Playing, vlc.State.Ended]:
+                                break
 
-                    self.mediaplayer.set_time(int(newTime))
+                        if flag_pause:
+                            self.mediaListPlayer.pause()
+                            while True:
+                                if self.mediaListPlayer.get_state() in [vlc.State.Paused, vlc.State.Ended]:
+                                    break
+
+                        '''self.pause_video()'''
+
+                    if time_ >= self.mediaplayer.get_media().get_duration() / 1000:
+                        
+                    else:
+                        self.mediaplayer.set_time(int(newTime))
 
                     if self.simultaneousMedia:
                         # synchronize 2nd player
+                        '''
+                        if self.mediaListPlayer2.get_state() == vlc.State.Ended and time_ < self.mediaplayer.get_media().get_duration()/1000:
+                            self.play_video()
+                            while True:
+                                if self.mediaListPlayer2.get_state() in [vlc.State.Playing, vlc.State.Ended]:
+                                    break
+                            self.pause_video()
+                        '''
+    
                         self.mediaplayer2.set_time(int(self.mediaplayer.get_time() -
                                                        self.pj[OBSERVATIONS][self.observationId][TIME_OFFSET_SECOND_PLAYER] * 1000))
 
@@ -9816,6 +8629,7 @@ item []:
 
                 self.timer_out()
                 self.timer_spectro_out()
+                #self.timer_plot_data_out()
 
 
             if self.playMode == FFMPEG:
@@ -9830,6 +8644,7 @@ item []:
                     self.FFmpegGlobalFrame -= 1
 
                 self.ffmpegTimerOut()
+
 
     def twSubjects_doubleClicked(self):
         """
@@ -9851,6 +8666,7 @@ item []:
                 self.update_subject(self.twSubjects.item(row, 1).text())
         else:
             self.no_observation()
+
 
     def select_events_between_activated(self):
         """
@@ -9874,7 +8690,6 @@ item []:
                 except InvalidOperation:
                     return None
             return timeSeconds
-
 
         if self.twEvents.rowCount():
             text, ok = QInputDialog.getText(self, "Select events in time interval", "Interval: (example: 12.5-14.7 or 02:45.780-03:15.120)",
@@ -9914,6 +8729,7 @@ item []:
         else:
             QMessageBox.warning(self, programName, "There are no events to select")
 
+
     def delete_all_events(self):
         """
         delete all events in current observation
@@ -9932,6 +8748,7 @@ item []:
             self.projectChanged = True
             self.loadEventsInTW(self.observationId)
 
+
     def delete_selected_events(self):
         """
         delete selected observations
@@ -9945,12 +8762,16 @@ item []:
             QMessageBox.warning(self, programName, "No event selected!")
         else:
             # list of rows to delete (set for unique)
-            rows = set([item.row() for item in self.twEvents.selectedIndexes()])
-            self.pj[OBSERVATIONS][self.observationId][EVENTS] = [event
-                                                                 for idx, event in enumerate(self.pj[OBSERVATIONS][self.observationId][EVENTS])
-                                                                 if idx not in rows]
-            self.projectChanged = True
-            self.loadEventsInTW(self.observationId)
+            try:
+                rows = set([item.row() for item in self.twEvents.selectedIndexes()])
+                self.pj[OBSERVATIONS][self.observationId][EVENTS] = [event
+                                                                     for idx, event in enumerate(self.pj[OBSERVATIONS][self.observationId][EVENTS])
+                                                                     if idx not in rows]
+                self.projectChanged = True
+                self.loadEventsInTW(self.observationId)
+            except:
+                QMessageBox.critical(self, programName, "Problem during event deletion!")
+
 
     def edit_selected_events(self):
         """
@@ -9982,6 +8803,7 @@ item []:
                         self.projectChanged = True
                 self.loadEventsInTW(self.observationId)
 
+
     def click_signal_find_in_events(self, msg):
         """
         find in events when "Find" button of find dialog box is pressed
@@ -9990,9 +8812,8 @@ item []:
         if msg == "CLOSE":
             self.find_dialog.close()
             return
-        if not self.find_dialog.findText.text():
-            return
 
+        self.find_dialog.lb_message.setText("")
         fields_list = []
         if self.find_dialog.cbSubject.isChecked():
             fields_list.append(EVENT_SUBJECT_FIELD_IDX)
@@ -10002,11 +8823,18 @@ item []:
             fields_list.append(EVENT_MODIFIER_FIELD_IDX)
         if self.find_dialog.cbComment.isChecked():
             fields_list.append(EVENT_COMMENT_FIELD_IDX)
+        if not fields_list:
+            self.find_dialog.lb_message.setText('<font color="red">No fields selected!</font>')
+            return
+        if not self.find_dialog.findText.text():
+            self.find_dialog.lb_message.setText('<font color="red">Nothing to search!</font>')
+            return
 
         for event_idx, event in enumerate(self.pj[OBSERVATIONS][self.observationId][EVENTS]):
             if event_idx <= self.find_dialog.currentIdx:
                 continue
-            if (not self.find_dialog.cbFindInSelectedEvents.isChecked()) or (self.find_dialog.cbFindInSelectedEvents.isChecked() and event_idx in self.find_dialog.rowsToFind):
+            if ((not self.find_dialog.cbFindInSelectedEvents.isChecked()) or (self.find_dialog.cbFindInSelectedEvents.isChecked() 
+                and event_idx in self.find_dialog.rowsToFind)):
                 for idx in fields_list:
                     if self.find_dialog.findText.text() in event[idx]:
                         self.find_dialog.currentIdx = event_idx
@@ -10014,11 +8842,18 @@ item []:
                         self.twEvents.selectRow(event_idx)
                         return
 
-        if dialog.MessageDialog(programName, "<b>{}</b> not found! Search from beginning?".format(self.find_dialog.findText.text()), [YES, NO]) == YES:
-            self.find_dialog.currentIdx = -1
-            self.click_signal_find_in_events("FIND")
+        if msg != "FIND_FROM_BEGINING":
+            if dialog.MessageDialog(programName, "<b>{}</b> not found. Search from beginning?".format(self.find_dialog.findText.text()),
+                                [YES, NO]) == YES:
+                self.find_dialog.currentIdx = -1
+                self.click_signal_find_in_events("FIND_FROM_BEGINING")
+            else:
+                self.find_dialog.close()
         else:
-            self.find_dialog.close()
+            if self.find_dialog.currentIdx == -1:
+                self.find_dialog.lb_message.setText("<b>{}</b> not found".format(self.find_dialog.findText.text()))
+
+
 
     def find_events(self):
         """
@@ -10033,6 +8868,7 @@ item []:
         self.find_dialog.setWindowFlags(Qt.WindowStaysOnTopHint)
         self.find_dialog.show()
 
+
     def click_signal_find_replace_in_events(self, msg):
         """
         find/replace in events when "Find" button of find dialog box is pressed
@@ -10046,7 +8882,7 @@ item []:
             return
 
         if self.find_replace_dialog.cbFindInSelectedEvents.isChecked() and not len(self.find_replace_dialog.rowsToFind):
-            dialog.MessageDialog(programName, "There are no selected events", ["OK"])
+            dialog.MessageDialog(programName, "There are no selected events", [OK])
             return
 
         fields_list = []
@@ -10086,13 +8922,15 @@ item []:
                 self.find_replace_dialog.currentIdx_idx = -1
 
         if msg == "FIND_REPLACE":
-            if dialog.MessageDialog(programName, "{} not found.\nRestart find/replace from the beginning?".format(self.find_replace_dialog.findText.text()), [YES, NO]) == YES:
+            if dialog.MessageDialog(programName, "{} not found.\nRestart find/replace from the beginning?".format(self.find_replace_dialog.findText.text()),
+                                    [YES, NO]) == YES:
                 self.find_replace_dialog.currentIdx = -1
             else:
                 self.find_replace_dialog.close()
         if msg == "FIND_REPLACE_ALL":
             dialog.MessageDialog(programName, "{} substitution(s).".format(number_replacement), [OK])
             self.find_replace_dialog.close()
+
 
     def find_replace_events(self):
         """
@@ -10110,7 +8948,7 @@ item []:
 
     def export_tabular_events(self):
         """
-        export events from selected observations in various formats: TSV, CSV, ODS, XLSX, XLS
+        export events from selected observations in various formats: TSV, CSV, ODS, XLSX, XLS, HTML
         """
 
         # ask user observations to analyze
@@ -10119,246 +8957,65 @@ item []:
         if not selectedObservations:
             return
 
-        plot_parameters = self.choose_obs_subj_behav_category(selectedObservations,
-                                                              maxTime=0,
-                                                              flagShowIncludeModifiers=False,
-                                                              flagShowExcludeBehaviorsWoEvents=False)
+        parameters = self.choose_obs_subj_behav_category(selectedObservations,
+                                                         maxTime=0,
+                                                         flagShowIncludeModifiers=False,
+                                                         flagShowExcludeBehaviorsWoEvents=False)
 
-        if not plot_parameters["selected subjects"] or not plot_parameters["selected behaviors"]:
+        if not parameters["selected subjects"] or not parameters["selected behaviors"]:
             return
 
-        '''
-        includeMediaInfo = None
-        for obsId in selectedObservations:
-            if self.pj[OBSERVATIONS][obsId]["type"] in [MEDIA]:
-                includeMediaInfo = YES
-                break
-        '''
-
-        if len(selectedObservations) > 1:  # choose directory for exporting more observations
+        if len(selectedObservations) > 1:  # choose directory for exporting observations
 
             items = ("Tab Separated Values (*.tsv)",
                      "Comma separated values (*.csv)",
                      "Open Document Spreadsheet (*.ods)",
                      "Microsoft Excel Spreadsheet XLSX (*.xlsx)",
-                     "Microsoft Excel Spreadsheet XLS (*.xls)",
+                     "Legacy Microsoft Excel Spreadsheet XLS (*.xls)",
                      "HTML (*.html)")
             item, ok = QInputDialog.getItem(self, "Export events format", "Available formats", items, 0, False)
             if not ok:
                 return
             outputFormat = re.sub(".* \(\*\.", "", item)[:-1]
 
-            exportDir = QFileDialog(self).getExistingDirectory(self, "Choose a directory to export events", os.path.expanduser("~"), options=QFileDialog.ShowDirsOnly)
+            exportDir = QFileDialog(self).getExistingDirectory(self, "Choose a directory to export events", os.path.expanduser("~"),
+                                                               options=QFileDialog.ShowDirsOnly)
             if not exportDir:
                 return
 
+        if len(selectedObservations) == 1:
+            extended_file_formats = ["Tab Separated Values (*.tsv)",
+                           "Comma Separated Values (*.csv)",
+                           "Open Document Spreadsheet ODS (*.ods)",
+                           "Microsoft Excel Spreadsheet XLSX (*.xlsx)",
+                           "Legacy Microsoft Excel Spreadsheet XLS (*.xls)",
+                           "HTML (*.html)"]
+            file_formats = ["tsv", "csv", "ods", "xlsx", "xls", "html"]
+
+
+            if QT_VERSION_STR[0] == "4":
+                filediag_func = QFileDialog(self).getSaveFileNameAndFilter
+            else:
+                filediag_func = QFileDialog(self).getSaveFileName
+
+            fileName, filter_ = filediag_func(self, "Export events", "", ";;".join(extended_file_formats))
+
+            if not fileName:
+                return
+
+            outputFormat = file_formats[extended_file_formats.index(filter_)]
+            if pathlib.Path(fileName).suffix != "." + outputFormat:
+                fileName = str(pathlib.Path(fileName)) + "." + outputFormat
+
         for obsId in selectedObservations:
-            
-            total_length = "{0:.3f}".format(self.observationTotalMediaLength(obsId))
-            
-            if len(selectedObservations) == 1:
-                fileFormats = ("Tab Separated Values (*.txt *.tsv);;"
-                               "Comma Separated Values (*.txt *.csv);;"
-                               "Microsoft Excel Spreadsheet XLSX (*.xlsx);;"
-                               "Open Document Spreadsheet ODS (*.ods);;"
-                               "Legacy Microsoft Excel Spreadsheet XLS (*.xls);;"
-                               "HTML (*.html);;"
-                               "All files (*)")
-                while True:
-                    if QT_VERSION_STR[0] == "4":
-                        fileName, filter_ = QFileDialog(self).getSaveFileNameAndFilter(self, "Export events", "", fileFormats)
-                    else:
-                        fileName, filter_ = QFileDialog(self).getSaveFileName(self, "Export events", "", fileFormats)
+            if len(selectedObservations) > 1:
+                fileName = str(pathlib.Path(pathlib.Path(exportDir) / safeFileName(obsId)).with_suffix("." + outputFormat))
 
-                    if not fileName:
-                        return
+            r, msg = export_observation.export_events(parameters, obsId, self.pj[OBSERVATIONS][obsId], self.pj[ETHOGRAM],
+                                                      fileName, outputFormat)
+            if not r:
+                QMessageBox.critical(None, programName, msg, QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
 
-                    outputFormat = ""
-                    availableFormats = ("tsv", "csv", "xlsx)", "ods", "xls)", "html")  # ) allows to distinguish between xls and xlsx
-                    for fileExtension in availableFormats:
-                        if fileExtension in filter_:
-                            outputFormat = fileExtension.replace(")", "")
-                    if not outputFormat:
-                        QMessageBox.warning(self, programName, "Choose a file format", QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-                    else:
-                        break
-
-            else:
-
-                fileName = exportDir + os.sep + safeFileName(obsId) + "." + outputFormat
-
-            eventsWithStatus = self.update_events_start_stop2(self.pj[OBSERVATIONS][obsId][EVENTS])
-
-            # check max number of modifiers
-            max_modifiers = 0
-            for event in eventsWithStatus:
-                for c in pj_events_fields:
-                    if c == "modifier" and event[pj_obs_fields[c]]:
-                        max_modifiers = max(max_modifiers, len(event[pj_obs_fields[c]].split('|')))
-
-            # media file number
-            mediaNb = 0
-            if self.pj[OBSERVATIONS][obsId]["type"] in [MEDIA]:
-                for idx in self.pj[OBSERVATIONS][obsId][FILE]:
-                    for media in self.pj[OBSERVATIONS][obsId][FILE][idx]:
-                        mediaNb += 1
-
-            rows = []
-
-            # observation id
-            rows.append(["Observation id", obsId])
-            rows.append([""])
-
-            # media file name
-            if self.pj[OBSERVATIONS][obsId]["type"] in [MEDIA]:
-                rows.append(["Media file(s)"])
-            else:
-                rows.append(["Live observation"])
-            rows.append([""])
-
-            if self.pj[OBSERVATIONS][obsId][TYPE] in [MEDIA]:
-
-                for idx in self.pj[OBSERVATIONS][obsId][FILE]:
-                    for media in self.pj[OBSERVATIONS][obsId][FILE][idx]:
-                        rows.append(["Player #{0}".format(idx), media])
-            rows.append([""])
-
-            # date
-            if "date" in self.pj[OBSERVATIONS][obsId]:
-                rows.append(["Observation date", self.pj[OBSERVATIONS][obsId]["date"].replace("T", " ")])
-            rows.append([""])
-
-            # description
-            if "description" in self.pj[OBSERVATIONS][obsId]:
-                rows.append(["Description", eol2space(self.pj[OBSERVATIONS][obsId]["description"])])
-            rows.append([""])
-
-            # time offset
-            if "time offset" in self.pj[OBSERVATIONS][obsId]:
-                rows.append(["Time offset (s)", self.pj[OBSERVATIONS][obsId]["time offset"]])
-            rows.append([""])
-
-            # independent variables
-            if "independent_variables" in self.pj[OBSERVATIONS][obsId]:
-                rows.append(["independent variables"])
-
-                rows.append(["variable", "value"])
-
-                for variable in self.pj[OBSERVATIONS][obsId]["independent_variables"]:
-                    rows.append([variable, self.pj[OBSERVATIONS][obsId]["independent_variables"][variable]])
-
-            rows.append([""])
-
-            # write table header
-            col = 0
-            header = ["Time"]
-            header.extend(["Media file path", "Total length", "FPS"])
-
-            header.extend(["Subject", "Behavior"])
-            for x in range(1, max_modifiers + 1):
-                header.append("Modifier {}".format(x))
-            header.extend(["Comment", "Status"])
-
-            rows.append(header)
-
-            duration1 = []   # in seconds
-            if self.pj[OBSERVATIONS][obsId]["type"] in [MEDIA]:
-                try:
-                    for mediaFile in self.pj[OBSERVATIONS][obsId][FILE][PLAYER1]:
-                        duration1.append(self.pj[OBSERVATIONS][obsId]["media_info"]["length"][mediaFile])
-                except:
-                    pass
-
-            for event in eventsWithStatus:
-                
-                if (((event[SUBJECT_EVENT_FIELD] in plot_parameters["selected subjects"]) or
-                   (event[SUBJECT_EVENT_FIELD] == "" and NO_FOCAL_SUBJECT in plot_parameters["selected subjects"])) and
-                   (event[BEHAVIOR_EVENT_FIELD] in plot_parameters["selected behaviors"])):
-
-                    fields = []
-                    fields.append(intfloatstr(str(event[EVENT_TIME_FIELD_IDX])))
-
-                    if self.pj[OBSERVATIONS][obsId]["type"] in [MEDIA]:
-
-                        time_ = event[EVENT_TIME_FIELD_IDX] - self.pj[OBSERVATIONS][obsId][TIME_OFFSET]
-                        if time_ < 0:
-                            time_ = 0
-
-                        mediaFileIdx = [idx1 for idx1, x in enumerate(duration1) if time_ >= sum(duration1[0:idx1])][-1]
-                        fields.append(intfloatstr(str(self.pj[OBSERVATIONS][obsId][FILE][PLAYER1][mediaFileIdx])))
-                        fields.append(total_length)
-                        fields.append(self.pj[OBSERVATIONS][obsId]["media_info"]["fps"][self.pj[OBSERVATIONS][obsId][FILE][PLAYER1][mediaFileIdx]])  # fps
-
-                    if self.pj[OBSERVATIONS][obsId]["type"] in [LIVE]:
-                        fields.append(LIVE) # media
-                        fields.append(total_length) # total length
-                        fields.append("NA") # FPS
-
-                    fields.append(event[EVENT_SUBJECT_FIELD_IDX])
-                    fields.append(event[EVENT_BEHAVIOR_FIELD_IDX])
-
-                    modifiers = event[EVENT_MODIFIER_FIELD_IDX].split("|")
-                    while len(modifiers) < max_modifiers:
-                        modifiers.append("")
-
-                    for m in modifiers:
-                        fields.append(m)
-                    fields.append(event[EVENT_COMMENT_FIELD_IDX].replace(os.linesep, " "))
-                    # status
-                    fields.append(event[-1])
-
-                    rows.append(fields)
-
-            maxLen = max([len(r) for r in rows])
-            data = tablib.Dataset()
-
-            data.title = obsId
-            # check if worksheet name will be > 31 char
-            if outputFormat in ["xls", "xlsx"]:
-                for forbidden_char in r"\/*[]:?":
-                    data.title = data.title.replace(forbidden_char, " ")
-
-            if outputFormat in ["xls"]:
-                if len(data.title) > 31:
-                    data.title = data.title[0:31]
-                    QMessageBox.warning(None, programName,
-                                        ("The worksheet name for {} was shortened due to XLS format limitations.\n"
-                                         "The limit on worksheet name length is 31 characters").format(obsId),
-                                        QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-
-
-            for row in rows:
-                data.append(complete(row, maxLen))
-
-            try:
-                if outputFormat == "tsv":
-                    with open(fileName, "wb") as f:
-                        f.write(str.encode(data.tsv))
-                if outputFormat == "csv":
-                    with open(fileName, "wb") as f:
-                        f.write(str.encode(data.csv))
-                if outputFormat == "ods":
-                    with open(fileName, "wb") as f:
-                        f.write(data.ods)
-                if outputFormat == "xlsx":
-                    with open(fileName, "wb") as f:
-                        f.write(data.xlsx)
-                if outputFormat == "xls":
-                    with open(fileName, "wb") as f:
-                        f.write(data.xls)
-                if outputFormat == "html":
-                    with open(fileName, "wb") as f:
-                        f.write(str.encode(data.html))
-
-            except:
-                errorMsg = sys.exc_info()[1]
-
-                logging.critical(errorMsg)
-                QMessageBox.critical(None, programName, str(errorMsg), QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-
-            del data
-
-        self.statusbar.showMessage("Events exported", 0)
 
     def create_behavioral_strings(self, obsId, subj, plot_parameters):
         """
@@ -10367,7 +9024,7 @@ item []:
 
         s = ""
         currentStates = []
-        eventsWithStatus = self.update_events_start_stop2(self.pj[OBSERVATIONS][obsId][EVENTS])
+        eventsWithStatus = project_function.events_start_stop(self.pj[ETHOGRAM], self.pj[OBSERVATIONS][obsId][EVENTS])
 
         for event in eventsWithStatus:
             if event[EVENT_SUBJECT_FIELD_IDX] == subj or (subj == NO_FOCAL_SUBJECT and event[EVENT_SUBJECT_FIELD_IDX] == ""):
@@ -10413,7 +9070,7 @@ item []:
         """
         export events from selected observations by subject as behavioral strings (plain text file)
         behaviors are separated by character specified in self.behaviouralStringsSeparator (usually pipe |)
-        for use with BSA (see http://penelope.unito.it/bsa)
+        for use with Behatrix (see http://www.boris.unito.it/pages/behatrix)
         """
 
         # ask user observations to analyze
@@ -10477,6 +9134,7 @@ item []:
                 errorMsg = sys.exc_info()[1]
                 logging.critical(errorMsg)
                 QMessageBox.critical(None, programName, str(errorMsg), QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
+
 
     def transitions_matrix(self, mode):
         """
@@ -10558,6 +9216,7 @@ item []:
                 except:
                     QMessageBox.critical(self, programName, "The file {} can not be saved".format(fileName))
 
+
     def transitions_dot_script(self):
         """
         create dot script (graphviz language) from transitions frequencies matrix
@@ -10585,6 +9244,7 @@ item []:
         if out:
             QMessageBox.information(self, programName,
                                     out + "<br><br>The DOT scripts can be used with Graphviz or WebGraphviz to generate diagram")
+
 
     def transitions_flow_diagram(self):
         """
@@ -10629,6 +9289,7 @@ item []:
         if out:
             QMessageBox.information(self, programName, out)
 
+
     def closeEvent(self, event):
         """
         check if current project is saved
@@ -10656,8 +9317,10 @@ item []:
 
         self.close_tool_windows()
 
+
     def actionQuit_activated(self):
         self.close()
+
 
     def import_observations(self):
         """
@@ -10673,7 +9336,6 @@ item []:
             return
 
         if fileName:
-
             try:
                 fromProject = json.loads(open(fileName, "r").read())
             except:
@@ -10681,7 +9343,7 @@ item []:
                 return
 
             # transform time to decimal
-            fromProject = self.convert_time_to_decimal(fromProject)
+            fromProject = convert_time_to_decimal(fromProject)  # function in utilities.py
 
             dbc = dialog.ChooseObservationsToImport("Choose the observations to import:", sorted(list(fromProject[OBSERVATIONS].keys())))
 
@@ -10749,6 +9411,7 @@ item []:
                     if flagImported:
                         QMessageBox.information(self, programName, "Observations imported successfully")
 
+
     def play_video(self):
         """
         play video
@@ -10759,7 +9422,6 @@ item []:
                 self.FFmpegTimer.start()
             else:
                 self.mediaListPlayer.play()
-
                 # second video together
                 if self.simultaneousMedia:
                     self.mediaListPlayer2.play()
@@ -10767,22 +9429,22 @@ item []:
                 self.timer.start(200)
                 self.timer_spectro.start()
 
+
     def pause_video(self):
         """
         pause media
-        does not pause media if already paused (otherwise media will be played)
+        does not pause media if already paused (to prevent that media will be played)
         """
 
         if self.playerType == VLC:
-
             if self.playMode == FFMPEG:
                 self.FFmpegTimer.stop()
             else:
-
                 if self.mediaListPlayer.get_state() != vlc.State.Paused:
 
                     self.timer.stop()
                     self.timer_spectro.stop()
+
                     self.mediaListPlayer.pause()
                     # wait for pause
 
@@ -10805,12 +9467,14 @@ item []:
                 self.timer_out()
                 self.timer_spectro_out()
 
+
     def play_activated(self):
         """
         button 'play' activated
         """
         if self.observationId and self.pj[OBSERVATIONS][self.observationId][TYPE] in [MEDIA]:
             self.play_video()
+
 
     def jumpBackward_activated(self):
         '''
@@ -10848,13 +9512,8 @@ item []:
                     if newTime < self.fast * 1000:
                         newTime = 0
 
-                    logging.debug('newTime: {0}'.format(newTime))
-                    logging.debug('sum self.duration: {0}'.format(sum(self.duration)))
-
                     # remember if player paused (go previous will start playing)
                     flagPaused = self.mediaListPlayer.get_state() == vlc.State.Paused
-
-                    logging.debug('flagPaused: {0}'.format(flagPaused))
 
                     tot = 0
                     for idx, d in enumerate(self.duration):
@@ -10883,6 +9542,7 @@ item []:
 
                 # no subtitles
                 # self.mediaplayer.video_set_spu(0)
+
 
     def jumpForward_activated(self):
         """
@@ -10960,12 +9620,6 @@ item []:
                 self.timer_out()
                 self.timer_spectro_out()
 
-                # no subtitles
-                '''
-                logging.debug('no subtitle')
-                self.mediaplayer.video_set_spu(0)
-                logging.debug('no subtitle done')
-                '''
 
     def reset_activated(self):
         """
@@ -10995,19 +9649,13 @@ item []:
                 self.timer_out()
                 self.timer_spectro_out()
 
+
     def changedFocusSlot(self, old, now):
         """
         connect events filter when app gains focus
         """
-        logging.debug("focus changed")
-
         if window.focusWidget():
             window.focusWidget().installEventFilter(self)
-
-        '''
-        if app.focusWidget():
-            app.focusWidget().installEventFilter(self)
-        '''
 
 
 if __name__ == "__main__":
@@ -11015,10 +9663,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
 
     # splashscreen
-    if (not options.nosplashscreen
-        and not options.observations_list
-        and not options.project_info
-        and not options.action):
+    if (not options.nosplashscreen):
         start = time.time()
         splash = QSplashScreen(QPixmap(os.path.dirname(os.path.realpath(__file__)) + "/splash.png"))
         splash.show()
@@ -11045,14 +9690,18 @@ if __name__ == "__main__":
                                                  "Go to http://www.videolan.org/vlc to update it").format(vlc.libvlc_get_version()),
                              QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
 
-        logging.critical(("The VLC media player seems old ({})."
+        logging.critical(("The VLC media player seems a little bit old... ({})."
                           "Go to http://www.videolan.org/vlc to update it").format(vlc.libvlc_get_version()))
         sys.exit(2)
 
     # check FFmpeg
-    ffmpeg_bin = check_ffmpeg_path()
-    if not ffmpeg_bin:
+    ret, msg = check_ffmpeg_path()
+    if not ret:
+        QMessageBox.critical(None, programName, "FFmpeg is not available.<br>Go to http://www.ffmpeg.org to download it",
+                             QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
         sys.exit(3)
+    else:
+        ffmpeg_bin = msg
 
     # check matplotlib
     if not FLAG_MATPLOTLIB_INSTALLED:
@@ -11069,8 +9718,7 @@ if __name__ == "__main__":
     observation_to_open = ""
     if options.project:
         project_to_open = options.project
-    
-    
+
     logging.debug("args: {}".format(args))
     if args and len(args) > 0:
        project_to_open = args[0]
@@ -11088,57 +9736,22 @@ if __name__ == "__main__":
         observation_to_open = args[1]
 
     if project_to_open:
-        window.open_project_json(os.path.abspath(project_to_open))
 
-    if options.project_info:
-        if not project_to_open:
-            print("No project file!")
-            sys.exit()
-        print("Summary of {} project file:".format(os.path.abspath(project_to_open)))
-        print("Project name: {}".format(window.pj[PROJECT_NAME]))
-        print("Project date: {}".format(window.pj[PROJECT_DATE]))
-        print("Project description: {}".format(window.pj[PROJECT_DESCRIPTION]))
-        print("Number of behaviors in ethogram: {}".format(len(window.pj[ETHOGRAM])))
-        print("Behaviors: {}".format(",".join([window.pj[ETHOGRAM][k]["code"] for k in sorted_keys(window.pj[ETHOGRAM])])))
-        print("Number of subjects: {}".format(len(window.pj[SUBJECTS])))
-        print("Subjects: {}".format(",".join([window.pj[SUBJECTS][k]["name"] for k in sorted_keys(window.pj[SUBJECTS])])))
-        print("Number of observations: {}".format(len(window.pj[OBSERVATIONS])))
-        print("Observations: {}".format(",".join(sorted(window.pj[OBSERVATIONS].keys()))))
-        sys.exit(0)
+        project_path, project_changed, pj, msg = project_functions.open_project_json(project_to_open)
 
-    if options.observations_list:
-        if not project_to_open:
-            print("No project file!")
-            sys.exit()
-
-        print("List of observation(s) in {} project file:".format(os.path.abspath(project_to_open)))
-        print(os.linesep.join(sorted(window.pj[OBSERVATIONS].keys())))
-        sys.exit(0)
-
-    if options.action:
-        if not project_to_open:
-            print("No project file!")
-            sys.exit()
-
-        if options.action == "check_state_events_obs":
-            
-            if not observation_to_open:
-                print("No observation!")
-                sys.exit()
-                
-            if observation_to_open not in window.pj[OBSERVATIONS]:
-                print("Observation not found in project!")
-                sys.exit()
-            
-            print(window.check_state_events_obs(observation_to_open)[1])
-            sys.exit()
+        if "error" in pj:
+            logging.debug(pj["error"])
+            QMessageBox.critical(window, programName, pj["error"])
+        else:
+            if msg:
+                QMessageBox.information(window, programName, msg)
+            window.load_project(project_path, project_changed, pj)
 
     if observation_to_open:
         r = window.load_observation(observation_to_open)
         if r:
             QMessageBox.warning(None, programName, "Error opening observation: <b>{}</b><br>{}".format(observation_to_open, r.split(":")[1]),
                                 QMessageBox.Ok | QMessageBox.Default, QMessageBox.NoButton)
-
 
     window.show()
     window.raise_()
